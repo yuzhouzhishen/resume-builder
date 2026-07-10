@@ -343,6 +343,85 @@ test("recovery lock release failure is retryable and does not wedge later manage
   assert.equal(existsSync(lockRoot), false);
 });
 
+test("recovery releases a partially acquired lock after claimed-owner verification fails", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const selectedId = snapshotId(source.basename);
+  const lockPath = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
+  let verificationCalls = 0;
+  const firstManager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "partial-claim-lock",
+    tokenFactory: () => "partial-claim-restore",
+    verifyClaimedLock() {
+      verificationCalls += 1;
+      throw new Error(`claimed owner read failed at ${parent}`);
+    }
+  });
+
+  const error = captureError(() => firstManager.restore(selectedId));
+
+  assert.equal(error.statusCode, 500);
+  assert.equal(error.code, "restore-lock-acquire-failed");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(verificationCalls, 1);
+  assert.equal(existsSync(lockPath), false);
+  assert.equal(
+    readdirSync(parent).some((entry) => entry.endsWith(".tmp")),
+    false
+  );
+  firstManager.dispose();
+
+  const secondManager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "second-partial-claim-lock",
+    tokenFactory: () => "second-partial-claim-restore"
+  });
+  const result = secondManager.restore(selectedId);
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.equal(existsSync(lockPath), false);
+});
+
+test("recovery never releases a replacement after partial lock acquisition", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const selectedId = snapshotId(source.basename);
+  const lockPath = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "replaced-partial-lock",
+    tokenFactory: () => "replaced-partial-restore",
+    verifyClaimedLock(claimedPath) {
+      unlinkSync(claimedPath);
+      writeFileSync(
+        claimedPath,
+        `${JSON.stringify({ pid: process.pid, token: "foreign-owner" })}\n`,
+        { flag: "wx", mode: 0o600 }
+      );
+      throw new Error(`claimed lock replaced at ${parent}`);
+    }
+  });
+
+  const error = captureError(() => manager.restore(selectedId));
+
+  assert.equal(error.code, "restore-lock-acquire-failed");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(lstatSync(lockPath).isFile(), true);
+  assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), {
+    pid: process.pid,
+    token: "foreign-owner"
+  });
+  const blockedManager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "blocked-after-replacement",
+    tokenFactory: () => "unused-after-replacement"
+  });
+  const blocked = captureError(() => blockedManager.restore(selectedId));
+  assert.equal(blocked.statusCode, 423);
+  assert.equal(blocked.code, "restore-locked");
+  assert.equal(existsSync(source.rootDir), true);
+});
+
 test("rejects malformed and unknown snapshot IDs without filesystem writes", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");

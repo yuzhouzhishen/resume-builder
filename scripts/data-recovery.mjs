@@ -43,6 +43,7 @@ export function createDataRecoveryManager(options) {
   const mkdir = options.mkdir || mkdirSync;
   const rename = options.rename || renameSync;
   const unlink = options.unlink || unlinkSync;
+  const verifyClaimedLock = options.verifyClaimedLock || readLockOwner;
   const validate = options.validate || validateDataRoot;
   const remove = options.remove || rmSync;
   const isProcessAlive = options.isProcessAlive || processIsAlive;
@@ -479,14 +480,14 @@ export function createDataRecoveryManager(options) {
           );
         }
 
-        const claimedOwner = readLockOwner(lockPath);
-        assertSameLockOwner(temporaryOwner, claimedOwner);
         ownedLock = {
           path: lockPath,
-          identity: claimedOwner.identity,
+          identity: temporaryOwner.identity,
           pid: process.pid,
           token: lockToken
         };
+        const claimedOwner = verifyClaimedLock(lockPath);
+        assertSameLockOwner(temporaryOwner, claimedOwner);
         return;
       } catch (error) {
         if (error.statusCode) {
