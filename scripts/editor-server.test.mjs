@@ -2934,6 +2934,16 @@ test("data recovery APIs map request, method, and manager errors safely", async 
       code: "invalid-snapshot-id"
     },
     {
+      name: "null body",
+      request: () => fetch(`${app.url}/api/data/recovery/restore`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "null"
+      }),
+      status: 400,
+      code: "invalid-snapshot-id"
+    },
+    {
       name: "unknown snapshot id",
       request: () => fetch(`${app.url}/api/data/recovery/restore`, {
         method: "POST",
@@ -2973,6 +2983,7 @@ test("data recovery APIs map request, method, and manager errors safely", async 
     if (scenario.code) {
       assert.equal(body.code, scenario.code, scenario.name);
     }
+    assert.equal(JSON.stringify(body).includes(dataRoot), false, scenario.name);
   }
 
   const staleError = new Error("The selected snapshot changed before restore.");
@@ -3005,10 +3016,16 @@ test("data recovery APIs map request, method, and manager errors safely", async 
   const leakedPath = path.join(dataRoot, "private", "snapshot");
   const unexpectedManager = stubRecoveryManager({
     list() {
-      throw new Error(`EACCES: ${leakedPath}`);
+      const error = new Error(`Known code with wrong status: ${leakedPath}`);
+      error.statusCode = 500;
+      error.code = "snapshot-not-found";
+      throw error;
     },
     restore() {
-      throw new Error(`ENOENT: ${leakedPath}`);
+      const error = new Error(`Internal failure at ${leakedPath}`);
+      error.statusCode = 500;
+      error.code = "internal-failure";
+      throw error;
     }
   });
   const unexpectedApp = await startEditorServer({
@@ -3036,6 +3053,47 @@ test("data recovery APIs map request, method, and manager errors safely", async 
     });
     assert.equal(JSON.stringify(body).includes(leakedPath), false);
   }
+});
+
+test("recovery method semantics precede an active replacement gate", async (t) => {
+  const rootDir = makeApiFixture();
+  let replacementChecks = 0;
+  let listCalls = 0;
+  let restoreCalls = 0;
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    dataImportManager: stubImportManager({
+      isCommitting() {
+        replacementChecks += 1;
+        return true;
+      }
+    }),
+    dataRecoveryManager: stubRecoveryManager({
+      list() {
+        listCalls += 1;
+        return [];
+      },
+      restore() {
+        restoreCalls += 1;
+        return replacementResult("restore");
+      }
+    }),
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const restoreResponse = await fetch(`${app.url}/api/data/recovery/restore`);
+  const snapshotsResponse = await fetch(`${app.url}/api/data/recovery/snapshots`, {
+    method: "POST"
+  });
+
+  assert.equal(restoreResponse.status, 405);
+  assert.equal(snapshotsResponse.status, 405);
+  assert.equal(replacementChecks, 0);
+  assert.equal(listCalls, 0);
+  assert.equal(restoreCalls, 0);
 });
 
 test("data recovery manager injection disposes both managers exactly once", async () => {

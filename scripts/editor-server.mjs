@@ -36,6 +36,33 @@ const DEFAULT_PHOTO_LIMIT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_DATA_ARCHIVE_LIMIT_BYTES = 50 * 1024 * 1024;
 const BACKUP_DIR = "backups";
 const BACKUP_FILE_PATTERN = /^resume-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-\d+)?\.yaml$/;
+const DATA_RECOVERY_PUBLIC_ERROR_STATUSES = new Map([
+  ["invalid-snapshot-id", 400],
+  ["snapshot-not-found", 404],
+  ["snapshot-invalid", 409],
+  ["restore-staging-exists", 409],
+  ["restore-staging-identity-lost", 409],
+  ["restore-source-changed", 409],
+  ["restore-staging-copy-mismatch", 409],
+  ["restore-staging-invalid", 409],
+  ["restore-locked", 423],
+  ["restore-cleanup-pending", 423],
+  ["snapshot-scan-failed", 500],
+  ["invalid-restore-token", 500],
+  ["restore-token-failed", 500],
+  ["restore-staging-create-failed", 500],
+  ["restore-copy-failed", 500],
+  ["restore-backup-reservation-failed", 500],
+  ["restore-backup-failed", 500],
+  ["restore-rollback-failed", 500],
+  ["restore-publish-failed", 500],
+  ["restore-quarantine-failed", 500],
+  ["restore-final-validation-failed", 500],
+  ["restore-cleanup-failed", 500],
+  ["restore-lock-release-failed", 500],
+  ["restore-lock-token-failed", 500],
+  ["restore-lock-acquire-failed", 500]
+]);
 const EXAMPLES = [
   { id: "cpp", label: "C++", path: "examples/cpp.yaml" },
   { id: "ai-agent", label: "AI Agent", path: "examples/ai-agent.yaml" }
@@ -371,9 +398,7 @@ function handleDataImportCancelApi(request, response, dataImportManager, token) 
 function sendDataRecoveryError(response, error) {
   const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 0;
   if (
-    statusCode >= 400
-    && statusCode <= 599
-    && typeof error?.code === "string"
+    DATA_RECOVERY_PUBLIC_ERROR_STATUSES.get(error?.code) === statusCode
     && typeof error?.message === "string"
   ) {
     sendJson(response, statusCode, {
@@ -420,6 +445,14 @@ async function handleDataRecoveryRestoreApi(
     body = await readJsonBody(request, bodyLimitBytes);
   } catch (error) {
     sendJson(response, error.statusCode || 400, { ok: false, error: error.message });
+    return;
+  }
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    sendJson(response, 400, {
+      ok: false,
+      error: "Snapshot ID is invalid.",
+      code: "invalid-snapshot-id"
+    });
     return;
   }
 
@@ -1011,6 +1044,16 @@ export function createEditorServer(options = {}) {
       return;
     }
 
+    if (url.pathname === "/api/data/recovery/restore" && request.method !== "POST") {
+      await handleDataRecoveryRestoreApi(
+        request,
+        response,
+        dataRecoveryManager,
+        bodyLimitBytes
+      );
+      return;
+    }
+
     if (url.pathname === "/api/data/recovery/restore") {
       if (!mutationGate.beginReplacement()) {
         sendJson(response, 423, {
@@ -1029,6 +1072,11 @@ export function createEditorServer(options = {}) {
       } finally {
         mutationGate.endReplacement();
       }
+      return;
+    }
+
+    if (url.pathname === "/api/data/recovery/snapshots") {
+      await handleDataRecoverySnapshotsApi(request, response, dataRecoveryManager);
       return;
     }
 
@@ -1052,11 +1100,6 @@ export function createEditorServer(options = {}) {
         dataImportManager,
         dataArchiveLimitBytes
       );
-      return;
-    }
-
-    if (url.pathname === "/api/data/recovery/snapshots") {
-      await handleDataRecoverySnapshotsApi(request, response, dataRecoveryManager);
       return;
     }
 
