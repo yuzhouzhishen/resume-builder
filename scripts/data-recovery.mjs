@@ -1,11 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
+  constants,
   cpSync,
   existsSync,
+  fstatSync,
   lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
   readdirSync,
   renameSync,
-  rmSync
+  rmdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync
 } from "node:fs";
 import path from "node:path";
 
@@ -22,14 +31,23 @@ export function listDataSnapshots(options) {
 
 export function createDataRecoveryManager(options) {
   const dataRoot = path.resolve(options.dataRoot);
+  const parentDir = path.dirname(dataRoot);
+  const dataBasename = path.basename(dataRoot);
+  const lockRoot = path.join(parentDir, `.${dataBasename}.recovery-lock`);
   const now = options.now || (() => new Date());
   const tokenFactory = options.tokenFactory || randomUUID;
+  const lockTokenFactory = options.lockTokenFactory || randomUUID;
   const copy = options.copy || cpSync;
+  const mkdir = options.mkdir || mkdirSync;
   const rename = options.rename || renameSync;
+  const rmdir = options.rmdir || rmdirSync;
+  const unlink = options.unlink || unlinkSync;
   const validate = options.validate || validateDataRoot;
   const remove = options.remove || rmSync;
+  const isProcessAlive = options.isProcessAlive || processIsAlive;
   let restoring = false;
   let ownedStaging = null;
+  let ownedLock = null;
 
   function list() {
     return discoverDataSnapshots(dataRoot).map(({ summary }) => summary);
@@ -38,6 +56,13 @@ export function createDataRecoveryManager(options) {
   function restore(snapshotId) {
     if (restoring) {
       throw createStatusError("A data restore is already in progress.", 423, "restore-locked");
+    }
+    if (ownedStaging) {
+      throw createStatusError(
+        "A previous restore staging cleanup is still pending.",
+        423,
+        "restore-cleanup-pending"
+      );
     }
     if (typeof snapshotId !== "string" || !SNAPSHOT_ID_PATTERN.test(snapshotId)) {
       throw createStatusError("Snapshot ID is invalid.", 400, "invalid-snapshot-id");
@@ -60,36 +85,68 @@ export function createDataRecoveryManager(options) {
       throw createStatusError("Snapshot is not valid for restore.", 409, "snapshot-invalid");
     }
 
-    let token;
-    try {
-      token = validateToken(tokenFactory());
-    } catch (error) {
-      if (error.code === "invalid-restore-token") {
-        throw error;
-      }
-      throw createStatusError(
-        "A restore token could not be created.",
-        500,
-        "restore-token-failed"
-      );
-    }
-    const stagingRoot = path.join(
-      path.dirname(dataRoot),
-      `.${path.basename(dataRoot)}.restore-${token}`
-    );
-    if (existsSync(stagingRoot)) {
-      throw createStatusError(
-        "Restore staging is already in use.",
-        409,
-        "restore-staging-exists"
-      );
-    }
     restoring = true;
-    ownedStaging = stagingRoot;
 
     let primaryError = null;
+    let token;
+    let stagingRoot;
     let backupRoot;
     try {
+      acquireRecoveryLock();
+      try {
+        token = validateToken(tokenFactory());
+      } catch (error) {
+        if (error.code === "invalid-restore-token") {
+          throw error;
+        }
+        throw createStatusError(
+          "A restore token could not be created.",
+          500,
+          "restore-token-failed"
+        );
+      }
+      stagingRoot = path.join(parentDir, `.${dataBasename}.restore-${token}`);
+
+      try {
+        mkdir(stagingRoot, { recursive: false, mode: 0o700 });
+      } catch (error) {
+        if (error.code === "EEXIST") {
+          throw createStatusError(
+            "Restore staging is already in use.",
+            409,
+            "restore-staging-exists"
+          );
+        }
+        throw createStatusError(
+          "Restore staging could not be created.",
+          500,
+          "restore-staging-create-failed"
+        );
+      }
+      try {
+        ownedStaging = {
+          root: stagingRoot,
+          identity: readDirectoryIdentity(stagingRoot)
+        };
+      } catch {
+        throw createStatusError(
+          "Restore staging ownership could not be verified.",
+          409,
+          "restore-staging-identity-lost"
+        );
+      }
+
+      let sourceFingerprint;
+      try {
+        sourceFingerprint = fingerprintRegularTree(candidate.candidateRoot);
+      } catch {
+        throw createStatusError(
+          "The selected snapshot changed before it could be copied.",
+          409,
+          "restore-source-changed"
+        );
+      }
+
       try {
         copy(candidate.candidateRoot, stagingRoot, {
           errorOnExist: true,
@@ -101,6 +158,42 @@ export function createDataRecoveryManager(options) {
           "The selected snapshot could not be staged.",
           500,
           "restore-copy-failed"
+        );
+      }
+
+      let sourceAfterCopy;
+      try {
+        sourceAfterCopy = fingerprintRegularTree(candidate.candidateRoot);
+      } catch {
+        throw createStatusError(
+          "The selected snapshot changed while it was being copied.",
+          409,
+          "restore-source-changed"
+        );
+      }
+      if (sourceAfterCopy !== sourceFingerprint) {
+        throw createStatusError(
+          "The selected snapshot changed while it was being copied.",
+          409,
+          "restore-source-changed"
+        );
+      }
+
+      let stagingFingerprint;
+      try {
+        stagingFingerprint = fingerprintRegularTree(stagingRoot);
+      } catch {
+        throw createStatusError(
+          "The staged snapshot is not a safe regular-tree copy.",
+          409,
+          "restore-staging-copy-mismatch"
+        );
+      }
+      if (stagingFingerprint !== sourceFingerprint) {
+        throw createStatusError(
+          "The staged snapshot does not exactly match the selected snapshot.",
+          409,
+          "restore-staging-copy-mismatch"
         );
       }
 
@@ -128,12 +221,41 @@ export function createDataRecoveryManager(options) {
       }
 
       try {
+        assertOwnedDirectory(ownedStaging);
+      } catch {
+        throw createStatusError(
+          "Restore staging ownership changed before publication.",
+          409,
+          "restore-staging-identity-lost"
+        );
+      }
+
+      try {
         rename(dataRoot, backupRoot);
       } catch {
         throw createStatusError(
           "Current data could not be reserved for restore.",
           500,
           "restore-backup-failed"
+        );
+      }
+
+      try {
+        assertOwnedDirectory(ownedStaging);
+      } catch {
+        try {
+          rename(backupRoot, dataRoot);
+        } catch {
+          throw createStatusError(
+            "Restore staging ownership changed and the previous data could not be restored. Manual recovery is required.",
+            500,
+            "restore-rollback-failed"
+          );
+        }
+        throw createStatusError(
+          "Restore staging ownership changed before publication. The previous data was restored.",
+          409,
+          "restore-staging-identity-lost"
         );
       }
 
@@ -153,6 +275,35 @@ export function createDataRecoveryManager(options) {
           "Restore publication failed. The previous data was restored.",
           500,
           "restore-publish-failed"
+        );
+      }
+
+      try {
+        assertOwnedDirectory(ownedStaging, dataRoot);
+      } catch {
+        const quarantineRoot = findAvailablePath(`${dataRoot}.failed-restore-${token}`);
+        try {
+          rename(dataRoot, quarantineRoot);
+        } catch {
+          throw createStatusError(
+            "Published restore ownership changed and could not be quarantined. Manual recovery is required.",
+            500,
+            "restore-quarantine-failed"
+          );
+        }
+        try {
+          rename(backupRoot, dataRoot);
+        } catch {
+          throw createStatusError(
+            "Published restore ownership changed and the previous data could not be restored. Manual recovery is required.",
+            500,
+            "restore-rollback-failed"
+          );
+        }
+        throw createStatusError(
+          "Published restore ownership changed. The previous data was restored and the replacement was quarantined.",
+          409,
+          "restore-staging-identity-lost"
         );
       }
 
@@ -195,13 +346,14 @@ export function createDataRecoveryManager(options) {
       primaryError = error;
       throw error;
     } finally {
+      let finalizationError = null;
       try {
         if (ownedStaging) {
           try {
             removeOwnedStaging();
           } catch {
             if (!primaryError) {
-              throw createStatusError(
+              finalizationError = createStatusError(
                 "Temporary restore staging could not be cleaned up.",
                 500,
                 "restore-cleanup-failed"
@@ -209,28 +361,169 @@ export function createDataRecoveryManager(options) {
             }
           }
         }
+        if (ownedLock) {
+          try {
+            releaseOwnedLock();
+          } catch {
+            if (!primaryError && !finalizationError) {
+              finalizationError = createStatusError(
+                "The recovery transaction lock could not be released.",
+                500,
+                "restore-lock-release-failed"
+              );
+            }
+          }
+        }
       } finally {
         restoring = false;
+      }
+      if (finalizationError) {
+        throw finalizationError;
       }
     }
   }
 
   function dispose() {
-    if (!restoring && ownedStaging) {
+    if (restoring) {
+      return;
+    }
+    let disposalError = null;
+    if (ownedStaging) {
       try {
         removeOwnedStaging();
       } catch {
-        throw createStatusError(
+        disposalError = createStatusError(
           "Temporary restore staging could not be cleaned up.",
           500,
           "restore-cleanup-failed"
         );
       }
     }
+    if (ownedLock) {
+      try {
+        releaseOwnedLock();
+      } catch {
+        if (!disposalError) {
+          disposalError = createStatusError(
+            "The recovery transaction lock could not be released.",
+            500,
+            "restore-lock-release-failed"
+          );
+        }
+      }
+    }
+    if (disposalError) {
+      throw disposalError;
+    }
+  }
+
+  function acquireRecoveryLock() {
+    let lockToken;
+    try {
+      lockToken = validateToken(lockTokenFactory());
+    } catch {
+      throw createStatusError(
+        "A recovery transaction lock token could not be created.",
+        500,
+        "restore-lock-token-failed"
+      );
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        mkdir(lockRoot, { recursive: false, mode: 0o700 });
+      } catch (error) {
+        if (
+          error.code === "EEXIST"
+          && attempt === 0
+          && reclaimStaleRecoveryLock()
+        ) {
+          continue;
+        }
+        if (error.code === "EEXIST") {
+          throw createStatusError(
+            "Another recovery transaction is in progress.",
+            423,
+            "restore-locked"
+          );
+        }
+        throw createStatusError(
+          "The recovery transaction lock could not be acquired.",
+          500,
+          "restore-lock-acquire-failed"
+        );
+      }
+
+      let lockIdentity;
+      try {
+        lockIdentity = readDirectoryIdentity(lockRoot);
+        writeFileSync(
+          path.join(lockRoot, "owner.json"),
+          `${JSON.stringify({ pid: process.pid, token: lockToken })}\n`,
+          { encoding: "utf8", flag: "wx", mode: 0o600 }
+        );
+      } catch {
+        try {
+          assertDirectoryIdentity(lockRoot, lockIdentity);
+          rmdir(lockRoot);
+        } catch {
+          // Preserve any entry whose ownership can no longer be proven.
+        }
+        throw createStatusError(
+          "The recovery transaction lock could not be initialized.",
+          500,
+          "restore-lock-acquire-failed"
+        );
+      }
+
+      ownedLock = {
+        root: lockRoot,
+        identity: lockIdentity,
+        pid: process.pid,
+        token: lockToken
+      };
+      return;
+    }
+  }
+
+  function reclaimStaleRecoveryLock() {
+    let lockIdentity;
+    let owner;
+    try {
+      lockIdentity = readDirectoryIdentity(lockRoot);
+      owner = readLockOwner(path.join(lockRoot, "owner.json"));
+      if (isProcessAlive(owner.pid)) {
+        return false;
+      }
+      assertDirectoryIdentity(lockRoot, lockIdentity);
+      const currentOwner = readLockOwner(path.join(lockRoot, "owner.json"));
+      assertSameLockOwner(owner, currentOwner);
+      unlink(path.join(lockRoot, "owner.json"));
+      assertDirectoryIdentity(lockRoot, lockIdentity);
+      rmdir(lockRoot);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function releaseOwnedLock() {
+    assertOwnedDirectory(ownedLock);
+    const ownerPath = path.join(ownedLock.root, "owner.json");
+    const owner = readLockOwner(ownerPath);
+    if (owner.pid !== ownedLock.pid || owner.token !== ownedLock.token) {
+      throw new Error("Recovery lock ownership metadata changed");
+    }
+    assertOwnedDirectory(ownedLock);
+    unlink(ownerPath);
+    assertOwnedDirectory(ownedLock);
+    rmdir(ownedLock.root);
+    ownedLock = null;
   }
 
   function removeOwnedStaging() {
-    remove(ownedStaging, { force: true, recursive: true });
+    assertOwnedDirectory(ownedStaging);
+    remove(ownedStaging.root, { force: true, recursive: true });
     ownedStaging = null;
   }
 
@@ -423,4 +716,163 @@ function createStatusError(message, statusCode, code) {
   error.statusCode = statusCode;
   error.code = code;
   return error;
+}
+
+function readDirectoryIdentity(rootDir) {
+  const stats = lstatSync(rootDir);
+  if (!stats.isDirectory()) {
+    throw new Error("Filesystem entry is not a real directory");
+  }
+  return { dev: stats.dev, ino: stats.ino };
+}
+
+function assertOwnedDirectory(ownedDirectory, rootDir = ownedDirectory.root) {
+  const identity = readDirectoryIdentity(rootDir);
+  if (
+    identity.dev !== ownedDirectory.identity.dev
+    || identity.ino !== ownedDirectory.identity.ino
+  ) {
+    throw new Error("Filesystem directory identity changed");
+  }
+}
+
+function readLockOwner(ownerPath) {
+  const pathStats = lstatSync(ownerPath);
+  if (!pathStats.isFile()) {
+    throw new Error("Recovery lock owner is not a regular file");
+  }
+  const descriptor = openSync(
+    ownerPath,
+    constants.O_RDONLY | (constants.O_NOFOLLOW || 0)
+  );
+  try {
+    const openedStats = fstatSync(descriptor);
+    if (
+      !openedStats.isFile()
+      || openedStats.dev !== pathStats.dev
+      || openedStats.ino !== pathStats.ino
+    ) {
+      throw new Error("Recovery lock owner identity changed");
+    }
+    const metadata = JSON.parse(readFileSync(descriptor, "utf8"));
+    const finalStats = fstatSync(descriptor);
+    if (
+      finalStats.dev !== openedStats.dev
+      || finalStats.ino !== openedStats.ino
+      || finalStats.size !== openedStats.size
+    ) {
+      throw new Error("Recovery lock owner changed while being read");
+    }
+    if (
+      !Number.isInteger(metadata.pid)
+      || metadata.pid <= 0
+      || typeof metadata.token !== "string"
+      || !TOKEN_PATTERN.test(metadata.token)
+    ) {
+      throw new Error("Recovery lock owner metadata is invalid");
+    }
+    return {
+      pid: metadata.pid,
+      token: metadata.token,
+      identity: { dev: openedStats.dev, ino: openedStats.ino }
+    };
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function assertSameLockOwner(expected, actual) {
+  if (
+    expected.pid !== actual.pid
+    || expected.token !== actual.token
+    || expected.identity.dev !== actual.identity.dev
+    || expected.identity.ino !== actual.identity.ino
+  ) {
+    throw new Error("Recovery lock owner changed");
+  }
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+
+function fingerprintRegularTree(rootDir) {
+  const hash = createHash("sha256");
+  fingerprintDirectory(rootDir, "", hash, readDirectoryIdentity(rootDir));
+  return hash.digest("hex");
+}
+
+function fingerprintDirectory(directory, relativeDirectory, hash, identity) {
+  assertDirectoryIdentity(directory, identity);
+  updateFingerprint(hash, "directory", relativeDirectory);
+  const entries = readdirSync(directory).sort(compareStrings);
+  assertDirectoryIdentity(directory, identity);
+
+  for (const entry of entries) {
+    const entryPath = path.join(directory, entry);
+    const relativePath = relativeDirectory ? `${relativeDirectory}/${entry}` : entry;
+    const stats = lstatSync(entryPath);
+    if (stats.isDirectory()) {
+      fingerprintDirectory(
+        entryPath,
+        relativePath,
+        hash,
+        { dev: stats.dev, ino: stats.ino }
+      );
+      continue;
+    }
+    if (!stats.isFile()) {
+      throw new Error("Filesystem tree contains a non-regular entry");
+    }
+
+    const descriptor = openSync(
+      entryPath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW || 0)
+    );
+    try {
+      const openedStats = fstatSync(descriptor);
+      if (
+        !openedStats.isFile()
+        || openedStats.dev !== stats.dev
+        || openedStats.ino !== stats.ino
+      ) {
+        throw new Error("Filesystem file identity changed");
+      }
+      const bytes = readFileSync(descriptor);
+      const finalStats = fstatSync(descriptor);
+      if (
+        finalStats.dev !== openedStats.dev
+        || finalStats.ino !== openedStats.ino
+        || finalStats.size !== openedStats.size
+      ) {
+        throw new Error("Filesystem file changed while being read");
+      }
+      updateFingerprint(hash, "file", relativePath, bytes);
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+
+  assertDirectoryIdentity(directory, identity);
+}
+
+function assertDirectoryIdentity(directory, expectedIdentity) {
+  const identity = readDirectoryIdentity(directory);
+  if (
+    identity.dev !== expectedIdentity.dev
+    || identity.ino !== expectedIdentity.ino
+  ) {
+    throw new Error("Filesystem directory identity changed");
+  }
+}
+
+function updateFingerprint(hash, type, relativePath, bytes = Buffer.alloc(0)) {
+  const metadata = Buffer.from(`${type}\0${relativePath}\0${bytes.byteLength}\0`, "utf8");
+  hash.update(metadata);
+  hash.update(bytes);
 }

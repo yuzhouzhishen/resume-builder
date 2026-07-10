@@ -4,11 +4,13 @@ import { createHash } from "node:crypto";
 import {
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   renameSync,
+  rmdirSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -164,6 +166,111 @@ test("preserves an existing pre-restore timestamp path and uses the next suffix"
     readFileSync(path.join(`${reservedBackup}-2`, "assets/photo.svg"), "utf8"),
     "<svg>official-before</svg>"
   );
+});
+
+test("recovery lock blocks another manager before restore path selection", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const selectedId = snapshotId(source.basename);
+  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
+  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
+  let firstManager;
+  let secondManager;
+  let lockPresentDuringCopy = false;
+  let secondSucceeded = false;
+  let secondError;
+  let secondDuringReleaseError;
+  let secondTokenCalls = 0;
+  let secondNowCalls = 0;
+  let releaseCalls = 0;
+  let restoringDuringRelease;
+  secondManager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "second-lock-token",
+    tokenFactory() {
+      secondTokenCalls += 1;
+      return "second-restore-token";
+    },
+    now() {
+      secondNowCalls += 1;
+      return new Date("2026-07-11T08:09:10.000Z");
+    }
+  });
+  firstManager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "first-lock-token",
+    tokenFactory: () => "first-restore-token",
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    copy(sourceRoot, targetRoot, options) {
+      cpSync(sourceRoot, targetRoot, options);
+      lockPresentDuringCopy = existsSync(lockRoot);
+      try {
+        secondManager.restore(selectedId);
+        secondSucceeded = true;
+      } catch (error) {
+        secondError = error;
+      }
+    },
+    rmdir(target) {
+      releaseCalls += 1;
+      restoringDuringRelease = firstManager.isRestoring();
+      firstManager.dispose();
+      secondDuringReleaseError = captureError(() => secondManager.restore(selectedId));
+      rmdirSync(target);
+    }
+  });
+
+  const result = firstManager.restore(selectedId);
+
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.equal(lockPresentDuringCopy, true);
+  assert.equal(secondSucceeded, false);
+  assert.equal(secondError.statusCode, 423);
+  assert.equal(secondError.code, "restore-locked");
+  assert.equal(secondError.message.includes(parent), false);
+  assert.equal(secondDuringReleaseError.statusCode, 423);
+  assert.equal(secondDuringReleaseError.code, "restore-locked");
+  assert.equal(secondDuringReleaseError.message.includes(parent), false);
+  assert.equal(secondTokenCalls, 0);
+  assert.equal(secondNowCalls, 0);
+  assert.equal(releaseCalls, 1);
+  assert.equal(restoringDuringRelease, true);
+  assert.equal(existsSync(lockRoot), false);
+  assert.equal(existsSync(backupRoot), true);
+  assert.equal(existsSync(`${backupRoot}-2`), false);
+  assert.equal(firstManager.isRestoring(), false);
+  assert.equal(secondManager.isRestoring(), false);
+});
+
+test("recovery lock reclaims only a demonstrably stale owner", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
+  mkdirSync(lockRoot, { mode: 0o700 });
+  writeFileSync(
+    path.join(lockRoot, "owner.json"),
+    `${JSON.stringify({ pid: 999999, token: "dead-lock-token" })}\n`,
+    { mode: 0o600 }
+  );
+  let livenessChecks = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "replacement-lock-token",
+    tokenFactory: () => "stale-lock-restore-token",
+    isProcessAlive(pid) {
+      livenessChecks += 1;
+      assert.equal(pid, 999999);
+      return false;
+    }
+  });
+
+  const result = manager.restore(snapshotId(source.basename));
+
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.equal(livenessChecks, 1);
+  assert.equal(existsSync(lockRoot), false);
+  assert.equal(existsSync(source.rootDir), true);
+  assert.equal(manager.isRestoring(), false);
 });
 
 test("rejects malformed and unknown snapshot IDs without filesystem writes", (t) => {
@@ -498,6 +605,65 @@ test("restore preserves rollback failure when staging cleanup also fails", (t) =
   assert.equal(manager.isRestoring(), false);
 });
 
+test("restore retains failed staging cleanup ownership until dispose retries it", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const tokens = ["pending-cleanup-token", "after-dispose-token"];
+  const pendingStaging = path.join(
+    parent,
+    `.${path.basename(dataRoot)}.restore-pending-cleanup-token`
+  );
+  let copyCalls = 0;
+  let removeCalls = 0;
+  let tokenCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory() {
+      tokenCalls += 1;
+      return tokens.shift();
+    },
+    copy(sourceRoot, targetRoot, options) {
+      copyCalls += 1;
+      cpSync(sourceRoot, targetRoot, options);
+      if (copyCalls === 1) {
+        throw new Error(`copy failed at ${parent}`);
+      }
+    },
+    remove(target, options) {
+      removeCalls += 1;
+      if (removeCalls === 1) {
+        throw new Error(`cleanup failed at ${parent}`);
+      }
+      rmSync(target, options);
+    }
+  });
+  const selectedId = snapshotId(source.basename);
+
+  const firstError = captureError(() => manager.restore(selectedId));
+
+  assert.equal(firstError.code, "restore-copy-failed");
+  assert.equal(firstError.message.includes(parent), false);
+  assert.equal(validateDataRoot(pendingStaging).activeId, fixtureRegistry.activeId);
+  const pendingIdentity = lstatSync(pendingStaging);
+
+  const retryError = captureError(() => manager.restore(selectedId));
+  assert.equal(retryError.statusCode, 423);
+  assert.equal(retryError.code, "restore-cleanup-pending");
+  assert.equal(retryError.message.includes(parent), false);
+  assert.equal(tokenCalls, 1);
+  assert.equal(lstatSync(pendingStaging).dev, pendingIdentity.dev);
+  assert.equal(lstatSync(pendingStaging).ino, pendingIdentity.ino);
+
+  manager.dispose();
+
+  assert.equal(removeCalls, 2);
+  assert.equal(existsSync(pendingStaging), false);
+  const result = manager.restore(selectedId);
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.equal(tokenCalls, 2);
+  assert.equal(manager.isRestoring(), false);
+});
+
 test("restore keeps its lock active through injected staging cleanup", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
@@ -591,6 +757,160 @@ test("restore rejects unsafe tokens and never claims an existing staging directo
   assert.deepEqual(removeCalls, []);
   assert.equal(existsSync(dataRoot), true);
   assert.equal(existsSync(source.rootDir), true);
+});
+
+test("restore atomically claims staging without deleting an EEXIST foreign entry", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-atomic-token`);
+  const removeCalls = [];
+  let stagingClaimCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "atomic-token",
+    mkdir(target, options) {
+      if (target !== stagingRoot) {
+        return mkdirSync(target, options);
+      }
+      stagingClaimCalls += 1;
+      assert.deepEqual(options, { recursive: false, mode: 0o700 });
+      mkdirSync(target, options);
+      writeFileSync(path.join(target, "sentinel.txt"), "foreign staging");
+      const error = new Error(`staging already exists at ${parent}`);
+      error.code = "EEXIST";
+      throw error;
+    },
+    remove(target, options) {
+      removeCalls.push(target);
+      rmSync(target, options);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 409);
+  assert.equal(error.code, "restore-staging-exists");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(stagingClaimCalls, 1);
+  assert.equal(readFileSync(path.join(stagingRoot, "sentinel.txt"), "utf8"), "foreign staging");
+  assert.deepEqual(removeCalls, []);
+  assert.equal(existsSync(dataRoot), true);
+  assert.equal(existsSync(source.rootDir), true);
+  assert.equal(manager.isRestoring(), false);
+});
+
+test("restore requires staging to be an exact regular-tree copy", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-exact-copy-token`);
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "exact-copy-token",
+    copy(sourceRoot, targetRoot, options) {
+      cpSync(sourceRoot, targetRoot, options);
+      writeFileSync(path.join(targetRoot, "foreign.txt"), "foreign regular file");
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 409);
+  assert.equal(error.code, "restore-staging-copy-mismatch");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(source.rootDir, "assets/photo.svg"), "utf8"),
+    "<svg>selected-source</svg>"
+  );
+  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(manager.isRestoring(), false);
+});
+
+test("restore rejects source mutation during the staged copy", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>source-before-copy</svg>");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-source-change-token`);
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "source-change-token",
+    copy(sourceRoot, targetRoot, options) {
+      cpSync(sourceRoot, targetRoot, options);
+      writeFileSync(path.join(sourceRoot, "assets/photo.svg"), "<svg>source-mutated</svg>");
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 409);
+  assert.equal(error.code, "restore-source-changed");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(source.rootDir, "assets/photo.svg"), "utf8"),
+    "<svg>source-mutated</svg>"
+  );
+  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(manager.isRestoring(), false);
+});
+
+test("restore rejects a replaced staging inode before publication and restores current data", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-identity-token`);
+  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
+  const removeCalls = [];
+  let renameCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "identity-token",
+    rename(sourceRoot, targetRoot) {
+      renameCalls += 1;
+      if (renameCalls === 1) {
+        rmSync(stagingRoot, { force: true, recursive: true });
+        symlinkSync(
+          source.rootDir,
+          stagingRoot,
+          process.platform === "win32" ? "junction" : "dir"
+        );
+      }
+      renameSync(sourceRoot, targetRoot);
+    },
+    remove(target, options) {
+      removeCalls.push(target);
+      rmSync(target, options);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 409);
+  assert.equal(error.code, "restore-staging-identity-lost");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(renameCalls, 2);
+  assert.equal(lstatSync(dataRoot).isDirectory(), true);
+  assert.equal(lstatSync(dataRoot).isSymbolicLink(), false);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(existsSync(backupRoot), false);
+  assert.equal(lstatSync(stagingRoot).isSymbolicLink(), true);
+  assert.equal(existsSync(source.rootDir), true);
+  assert.deepEqual(removeCalls, []);
+  assert.equal(manager.isRestoring(), false);
 });
 
 test("discovers both snapshot types with newest-first timestamps and registry metadata", (t) => {
