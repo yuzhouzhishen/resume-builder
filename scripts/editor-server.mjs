@@ -36,32 +36,33 @@ const DEFAULT_PHOTO_LIMIT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_DATA_ARCHIVE_LIMIT_BYTES = 50 * 1024 * 1024;
 const BACKUP_DIR = "backups";
 const BACKUP_FILE_PATTERN = /^resume-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-\d+)?\.yaml$/;
-const DATA_RECOVERY_PUBLIC_ERROR_STATUSES = new Map([
-  ["invalid-snapshot-id", 400],
-  ["snapshot-not-found", 404],
-  ["snapshot-invalid", 409],
-  ["restore-staging-exists", 409],
-  ["restore-staging-identity-lost", 409],
-  ["restore-source-changed", 409],
-  ["restore-staging-copy-mismatch", 409],
-  ["restore-staging-invalid", 409],
-  ["restore-locked", 423],
-  ["restore-cleanup-pending", 423],
-  ["snapshot-scan-failed", 500],
-  ["invalid-restore-token", 500],
-  ["restore-token-failed", 500],
-  ["restore-staging-create-failed", 500],
-  ["restore-copy-failed", 500],
-  ["restore-backup-reservation-failed", 500],
-  ["restore-backup-failed", 500],
-  ["restore-rollback-failed", 500],
-  ["restore-publish-failed", 500],
-  ["restore-quarantine-failed", 500],
-  ["restore-final-validation-failed", 500],
-  ["restore-cleanup-failed", 500],
-  ["restore-lock-release-failed", 500],
-  ["restore-lock-token-failed", 500],
-  ["restore-lock-acquire-failed", 500]
+const SNAPSHOT_ID_PATTERN = /^[a-f0-9]{64}$/;
+const DATA_RECOVERY_PUBLIC_ERRORS = new Map([
+  ["invalid-snapshot-id", [400, "Snapshot ID is invalid."]],
+  ["snapshot-not-found", [404, "Snapshot is no longer available."]],
+  ["snapshot-invalid", [409, "Snapshot is not valid for restore."]],
+  ["restore-staging-exists", [409, "Restore staging is already in use."]],
+  ["restore-staging-identity-lost", [409, "Restore staging ownership changed during restore."]],
+  ["restore-source-changed", [409, "The selected snapshot changed during restore."]],
+  ["restore-staging-copy-mismatch", [409, "The staged snapshot does not match the selected snapshot."]],
+  ["restore-staging-invalid", [409, "The staged snapshot is not valid for restore."]],
+  ["restore-locked", [423, "Another data restore is in progress."]],
+  ["restore-cleanup-pending", [423, "A previous restore cleanup is still pending."]],
+  ["snapshot-scan-failed", [500, "Snapshots could not be scanned."]],
+  ["invalid-restore-token", [500, "Restore token is invalid."]],
+  ["restore-token-failed", [500, "A restore token could not be created."]],
+  ["restore-staging-create-failed", [500, "Restore staging could not be created."]],
+  ["restore-copy-failed", [500, "The selected snapshot could not be staged."]],
+  ["restore-backup-reservation-failed", [500, "A pre-restore backup location could not be reserved."]],
+  ["restore-backup-failed", [500, "Current data could not be reserved for restore."]],
+  ["restore-rollback-failed", [500, "The previous data could not be restored. Manual recovery is required."]],
+  ["restore-publish-failed", [500, "Restore publication failed. The previous data was restored."]],
+  ["restore-quarantine-failed", [500, "Failed restore data could not be quarantined. Manual recovery is required."]],
+  ["restore-final-validation-failed", [500, "Restored data failed final validation. The previous data was restored."]],
+  ["restore-cleanup-failed", [500, "Temporary restore staging could not be cleaned up."]],
+  ["restore-lock-release-failed", [500, "The recovery transaction lock could not be released."]],
+  ["restore-lock-token-failed", [500, "A recovery transaction lock token could not be created."]],
+  ["restore-lock-acquire-failed", [500, "The recovery transaction lock could not be acquired."]]
 ]);
 const EXAMPLES = [
   { id: "cpp", label: "C++", path: "examples/cpp.yaml" },
@@ -359,20 +360,25 @@ async function handleDataImportInspectApi(
   }
 }
 
-async function handleDataImportCommitApi(
-  request,
-  response,
-  dataImportManager,
-  bodyLimitBytes
-) {
-  if (request.method !== "POST") {
-    sendJson(response, 405, { ok: false, error: "Method not allowed." });
-    return;
+async function readDataImportCommitToken(request, bodyLimitBytes) {
+  const body = await readJsonBody(request, bodyLimitBytes);
+  if (
+    body === null
+    || typeof body !== "object"
+    || Array.isArray(body)
+    || typeof body.token !== "string"
+    || body.token.trim() === ""
+  ) {
+    const error = new Error("Unknown import token");
+    error.statusCode = 400;
+    throw error;
   }
+  return body.token;
+}
 
+async function commitDataImport(response, dataImportManager, token) {
   try {
-    const body = await readJsonBody(request, bodyLimitBytes);
-    const result = await dataImportManager.commit(body.token);
+    const result = await dataImportManager.commit(token);
     sendJson(response, 200, resumeRegistryResponse(result.registry, {
       preImportBackup: path.basename(result.preImportBackup),
       generation: "needs generate"
@@ -397,13 +403,11 @@ function handleDataImportCancelApi(request, response, dataImportManager, token) 
 
 function sendDataRecoveryError(response, error) {
   const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 0;
-  if (
-    DATA_RECOVERY_PUBLIC_ERROR_STATUSES.get(error?.code) === statusCode
-    && typeof error?.message === "string"
-  ) {
+  const publicError = DATA_RECOVERY_PUBLIC_ERRORS.get(error?.code);
+  if (publicError?.[0] === statusCode) {
     sendJson(response, statusCode, {
       ok: false,
-      error: error.message,
+      error: publicError[1],
       code: error.code
     });
     return;
@@ -429,35 +433,26 @@ async function handleDataRecoverySnapshotsApi(request, response, dataRecoveryMan
   }
 }
 
-async function handleDataRecoveryRestoreApi(
-  request,
-  response,
-  dataRecoveryManager,
-  bodyLimitBytes
-) {
-  if (request.method !== "POST") {
-    sendJson(response, 405, { ok: false, error: "Method not allowed." });
-    return;
+async function readDataRecoverySnapshotId(request, bodyLimitBytes) {
+  const body = await readJsonBody(request, bodyLimitBytes);
+  if (
+    body === null
+    || typeof body !== "object"
+    || Array.isArray(body)
+    || typeof body.snapshotId !== "string"
+    || !SNAPSHOT_ID_PATTERN.test(body.snapshotId)
+  ) {
+    const error = new Error("Snapshot ID is invalid.");
+    error.statusCode = 400;
+    error.code = "invalid-snapshot-id";
+    throw error;
   }
+  return body.snapshotId;
+}
 
-  let body;
+async function restoreDataRecovery(response, dataRecoveryManager, snapshotId) {
   try {
-    body = await readJsonBody(request, bodyLimitBytes);
-  } catch (error) {
-    sendJson(response, error.statusCode || 400, { ok: false, error: error.message });
-    return;
-  }
-  if (body === null || typeof body !== "object" || Array.isArray(body)) {
-    sendJson(response, 400, {
-      ok: false,
-      error: "Snapshot ID is invalid.",
-      code: "invalid-snapshot-id"
-    });
-    return;
-  }
-
-  try {
-    const result = await dataRecoveryManager.restore(body.snapshotId);
+    const result = await dataRecoveryManager.restore(snapshotId);
     sendJson(response, 200, resumeRegistryResponse(result.registry, {
       preRestoreBackup: path.basename(result.preRestoreBackup),
       generation: "needs generate"
@@ -982,6 +977,31 @@ async function handlePhotoApi(request, response, dataRoot, bodyLimitBytes, photo
   }
 }
 
+function createEditorDataManagers(options, dataRoot, dataArchiveLimitBytes) {
+  return {
+    dataImportManager: options.dataImportManager || createDataImportManager({
+      dataRoot,
+      limits: { maxArchiveBytes: dataArchiveLimitBytes }
+    }),
+    dataRecoveryManager: options.dataRecoveryManager || createDataRecoveryManager({ dataRoot })
+  };
+}
+
+function createDataManagerDisposer(dataImportManager, dataRecoveryManager) {
+  let disposed = false;
+  return () => {
+    if (disposed) {
+      return;
+    }
+    disposed = true;
+    try {
+      dataImportManager.dispose();
+    } finally {
+      dataRecoveryManager.dispose();
+    }
+  };
+}
+
 export function createEditorServer(options = {}) {
   const projectRoot = path.resolve(options.projectRoot || PROJECT_ROOT);
   const dataRoot = path.resolve(options.dataRoot || options.rootDir || PROJECT_ROOT);
@@ -989,11 +1009,11 @@ export function createEditorServer(options = {}) {
   const photoLimitBytes = options.photoLimitBytes ?? DEFAULT_PHOTO_LIMIT_BYTES;
   const dataArchiveLimitBytes = options.dataArchiveLimitBytes ?? DEFAULT_DATA_ARCHIVE_LIMIT_BYTES;
   const generateResume = options.generateResume || defaultGenerateResume;
-  const dataImportManager = options.dataImportManager || createDataImportManager({
+  const { dataImportManager, dataRecoveryManager } = createEditorDataManagers(
+    options,
     dataRoot,
-    limits: { maxArchiveBytes: dataArchiveLimitBytes }
-  });
-  const dataRecoveryManager = options.dataRecoveryManager || createDataRecoveryManager({ dataRoot });
+    dataArchiveLimitBytes
+  );
   const mutationGate = createDataMutationGate({
     isReplacing: () => dataImportManager.isCommitting()
       || dataRecoveryManager.isRestoring()
@@ -1029,6 +1049,17 @@ export function createEditorServer(options = {}) {
     }
 
     if (url.pathname === "/api/data/import/commit") {
+      if (request.method !== "POST") {
+        sendJson(response, 405, { ok: false, error: "Method not allowed." });
+        return;
+      }
+      let token;
+      try {
+        token = await readDataImportCommitToken(request, bodyLimitBytes);
+      } catch (error) {
+        sendJson(response, error.statusCode || 400, { ok: false, error: error.message });
+        return;
+      }
       if (!mutationGate.beginReplacement()) {
         sendJson(response, 423, {
           ok: false,
@@ -1037,7 +1068,7 @@ export function createEditorServer(options = {}) {
         return;
       }
       try {
-        await handleDataImportCommitApi(request, response, dataImportManager, bodyLimitBytes);
+        await commitDataImport(response, dataImportManager, token);
       } finally {
         mutationGate.endReplacement();
       }
@@ -1045,16 +1076,22 @@ export function createEditorServer(options = {}) {
     }
 
     if (url.pathname === "/api/data/recovery/restore" && request.method !== "POST") {
-      await handleDataRecoveryRestoreApi(
-        request,
-        response,
-        dataRecoveryManager,
-        bodyLimitBytes
-      );
+      sendJson(response, 405, { ok: false, error: "Method not allowed." });
       return;
     }
 
     if (url.pathname === "/api/data/recovery/restore") {
+      let snapshotId;
+      try {
+        snapshotId = await readDataRecoverySnapshotId(request, bodyLimitBytes);
+      } catch (error) {
+        if (error.code === "invalid-snapshot-id") {
+          sendDataRecoveryError(response, error);
+        } else {
+          sendJson(response, error.statusCode || 400, { ok: false, error: error.message });
+        }
+        return;
+      }
       if (!mutationGate.beginReplacement()) {
         sendJson(response, 423, {
           ok: false,
@@ -1063,12 +1100,7 @@ export function createEditorServer(options = {}) {
         return;
       }
       try {
-        await handleDataRecoveryRestoreApi(
-          request,
-          response,
-          dataRecoveryManager,
-          bodyLimitBytes
-        );
+        await restoreDataRecovery(response, dataRecoveryManager, snapshotId);
       } finally {
         mutationGate.endReplacement();
       }
@@ -1195,13 +1227,9 @@ export function createEditorServer(options = {}) {
       sendText(response, 404, "Not found");
     });
   });
-  server.once("close", () => {
-    try {
-      dataImportManager.dispose();
-    } finally {
-      dataRecoveryManager.dispose();
-    }
-  });
+  if (options.disposeDataManagersOnClose !== false) {
+    server.once("close", createDataManagerDisposer(dataImportManager, dataRecoveryManager));
+  }
   return server;
 }
 
@@ -1234,6 +1262,22 @@ export async function startEditorServer(options = {}) {
   const maxPort = options.maxPort ?? DEFAULT_MAX_PORT;
   const log = options.log === false ? null : options.log || console.log;
   const dataRoot = path.resolve(options.dataRoot || options.rootDir || PROJECT_ROOT);
+  const dataArchiveLimitBytes = options.dataArchiveLimitBytes ?? DEFAULT_DATA_ARCHIVE_LIMIT_BYTES;
+  const { dataImportManager, dataRecoveryManager } = createEditorDataManagers(
+    options,
+    dataRoot,
+    dataArchiveLimitBytes
+  );
+  const disposeDataManagers = createDataManagerDisposer(
+    dataImportManager,
+    dataRecoveryManager
+  );
+  const serverOptions = {
+    ...options,
+    dataImportManager,
+    dataRecoveryManager,
+    disposeDataManagersOnClose: false
+  };
 
   const candidatePorts = preferredPort === 0
     ? [0]
@@ -1242,45 +1286,51 @@ export async function startEditorServer(options = {}) {
       (_unused, index) => preferredPort + index
     );
 
-  for (const candidatePort of candidatePorts) {
-    const server = createEditorServer(options);
+  try {
+    for (const candidatePort of candidatePorts) {
+      const server = createEditorServer(serverOptions);
 
-    try {
-      await listen(server, host, candidatePort);
-      const address = server.address();
-      const port = typeof address === "object" && address ? address.port : candidatePort;
-      const url = `http://${host}:${port}`;
-      log?.(`Resume editor running at ${url}`);
-      log?.(`Resume data: ${dataRoot} (${options.dataStatus || "provided"})`);
-      return {
-        server,
-        host,
-        port,
-        url,
-        close: () => new Promise((resolve, reject) => {
-          server.close((error) => {
-            if (error) {
-              reject(error);
-              return;
-            }
-            resolve();
-          });
-          server.closeAllConnections();
-        })
-      };
-    } catch (error) {
-      server.close();
-      if (error.code === "EADDRINUSE" && candidatePort !== candidatePorts.at(-1)) {
-        continue;
+      try {
+        await listen(server, host, candidatePort);
+        server.once("close", disposeDataManagers);
+        const address = server.address();
+        const port = typeof address === "object" && address ? address.port : candidatePort;
+        const url = `http://${host}:${port}`;
+        log?.(`Resume editor running at ${url}`);
+        log?.(`Resume data: ${dataRoot} (${options.dataStatus || "provided"})`);
+        return {
+          server,
+          host,
+          port,
+          url,
+          close: () => new Promise((resolve, reject) => {
+            server.close((error) => {
+              if (error) {
+                reject(error);
+                return;
+              }
+              resolve();
+            });
+            server.closeAllConnections();
+          })
+        };
+      } catch (error) {
+        server.close();
+        if (error.code === "EADDRINUSE" && candidatePort !== candidatePorts.at(-1)) {
+          continue;
+        }
+        if (error.code === "EADDRINUSE") {
+          throw new Error(`Ports ${preferredPort}-${maxPort} are already in use. Close the process using them or set another port.`);
+        }
+        throw error;
       }
-      if (error.code === "EADDRINUSE") {
-        throw new Error(`Ports ${preferredPort}-${maxPort} are already in use. Close the process using them or set another port.`);
-      }
-      throw error;
     }
-  }
 
-  throw new Error(`No candidate ports available from ${preferredPort} to ${maxPort}.`);
+    throw new Error(`No candidate ports available from ${preferredPort} to ${maxPort}.`);
+  } catch (error) {
+    disposeDataManagers();
+    throw error;
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {

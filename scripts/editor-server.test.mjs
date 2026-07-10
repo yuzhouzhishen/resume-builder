@@ -1571,6 +1571,43 @@ test("editor server falls back when the preferred port is occupied", async (t) =
   assert.equal(app.url, `http://127.0.0.1:${occupiedPort + 1}`);
 });
 
+test("recovery managers survive occupied-port fallback until final close", async (t) => {
+  const blocker = await startPortBlocker();
+  t.after(() => blocker.close());
+  const occupiedPort = blocker.address().port;
+  let importDisposeCalls = 0;
+  let recoveryDisposeCalls = 0;
+  const app = await startEditorServer({
+    preferredPort: occupiedPort,
+    maxPort: occupiedPort + 1,
+    rootDir: makeApiFixture(),
+    dataImportManager: stubImportManager({
+      dispose() {
+        importDisposeCalls += 1;
+      }
+    }),
+    dataRecoveryManager: stubRecoveryManager({
+      dispose() {
+        recoveryDisposeCalls += 1;
+      }
+    }),
+    log: false
+  });
+  t.after(async () => {
+    if (app.server.listening) {
+      await app.close();
+    }
+  });
+
+  assert.equal(app.port, occupiedPort + 1);
+  assert.equal(importDisposeCalls, 0);
+  assert.equal(recoveryDisposeCalls, 0);
+
+  await app.close();
+  assert.equal(importDisposeCalls, 1);
+  assert.equal(recoveryDisposeCalls, 1);
+});
+
 test("GET /api/resume returns the current resume yaml", async (t) => {
   const rootDir = makeApiFixture();
   const app = await startEditorServer({
@@ -2986,7 +3023,8 @@ test("data recovery APIs map request, method, and manager errors safely", async 
     assert.equal(JSON.stringify(body).includes(dataRoot), false, scenario.name);
   }
 
-  const staleError = new Error("The selected snapshot changed before restore.");
+  const allowlistedLeak = path.join(dataRoot, "private", "allowlisted-snapshot");
+  const staleError = new Error(`Snapshot changed at ${allowlistedLeak}`);
   staleError.statusCode = 409;
   staleError.code = "restore-source-changed";
   const staleApp = await startEditorServer({
@@ -3009,7 +3047,7 @@ test("data recovery APIs map request, method, and manager errors safely", async 
   assert.equal(staleResponse.status, 409);
   assert.deepEqual(await staleResponse.json(), {
     ok: false,
-    error: staleError.message,
+    error: "The selected snapshot changed during restore.",
     code: staleError.code
   });
 
@@ -3088,9 +3126,11 @@ test("recovery method semantics precede an active replacement gate", async (t) =
   const snapshotsResponse = await fetch(`${app.url}/api/data/recovery/snapshots`, {
     method: "POST"
   });
+  const importResponse = await fetch(`${app.url}/api/data/import/commit`);
 
   assert.equal(restoreResponse.status, 405);
   assert.equal(snapshotsResponse.status, 405);
+  assert.equal(importResponse.status, 405);
   assert.equal(replacementChecks, 0);
   assert.equal(listCalls, 0);
   assert.equal(restoreCalls, 0);
@@ -3183,6 +3223,86 @@ test("replacement gate rejects recovery restore while generation is writing", as
   });
   assert.equal(retriedRestore.status, 200);
   assert.equal(restoreCalls, 1);
+});
+
+test("replacement gate waits for complete import and recovery bodies", async (t) => {
+  for (const replacementType of ["import", "restore"]) {
+    await t.test(replacementType, async (t) => {
+      const rootDir = makeApiFixture();
+      const generationStarted = deferred();
+      const releaseGeneration = deferred();
+      let replacementCalls = 0;
+      const app = await startEditorServer({
+        preferredPort: 0,
+        maxPort: 0,
+        rootDir,
+        generateResume: async () => {
+          generationStarted.resolve();
+          await releaseGeneration.promise;
+          return { density: "normal", metrics: { height: 900 } };
+        },
+        dataImportManager: stubImportManager({
+          commit() {
+            replacementCalls += 1;
+            return replacementResult("import");
+          }
+        }),
+        dataRecoveryManager: stubRecoveryManager({
+          restore() {
+            replacementCalls += 1;
+            return replacementResult("restore");
+          }
+        }),
+        log: false
+      });
+      t.after(async () => app.close());
+      const requestPath = replacementType === "import"
+        ? "/api/data/import/commit"
+        : "/api/data/recovery/restore";
+      const fullBody = JSON.stringify(
+        replacementType === "import"
+          ? { token: "token" }
+          : { snapshotId: "a".repeat(64) }
+      );
+      const requestStarted = once(app.server, "request");
+      const replacementRequest = http.request(`${app.url}${requestPath}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(fullBody)
+        }
+      });
+      replacementRequest.on("error", () => {});
+      const replacementResponse = new Promise((resolve) => {
+        replacementRequest.once("response", resolve);
+      });
+      replacementRequest.write("{");
+      await requestStarted;
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const generationRequest = fetch(`${app.url}/api/generate`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ resumeId: "cpp" })
+      });
+      let blockedReplacement;
+      try {
+        await waitForManagerStart(generationStarted.promise, generationRequest);
+        replacementRequest.end(fullBody.slice(1));
+        blockedReplacement = await replacementResponse;
+        blockedReplacement.resume();
+        await once(blockedReplacement, "end");
+      } finally {
+        releaseGeneration.resolve();
+        replacementRequest.destroy();
+      }
+      const generationResponse = await generationRequest;
+
+      assert.equal(blockedReplacement.statusCode, 423);
+      assert.equal(generationResponse.status, 200);
+      assert.equal(replacementCalls, 0);
+    });
+  }
 });
 
 test("replacement gate prevents import commit and recovery restore from overlapping", async (t) => {
