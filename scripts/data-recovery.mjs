@@ -1,14 +1,245 @@
-import { createHash } from "node:crypto";
-import { lstatSync, readdirSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  readdirSync,
+  renameSync,
+  rmSync
+} from "node:fs";
 import path from "node:path";
 
 import { validateDataRoot } from "./data-root.mjs";
 
 const INVALID_DATA_REASON = "Snapshot data is invalid.";
 const UNSAFE_TREE_REASON = "Snapshot contains an unsafe filesystem entry.";
+const SNAPSHOT_ID_PATTERN = /^[a-f0-9]{64}$/;
+const TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export function listDataSnapshots(options) {
+  return discoverDataSnapshots(options.dataRoot).map(({ summary }) => summary);
+}
+
+export function createDataRecoveryManager(options) {
   const dataRoot = path.resolve(options.dataRoot);
+  const now = options.now || (() => new Date());
+  const tokenFactory = options.tokenFactory || randomUUID;
+  const copy = options.copy || cpSync;
+  const rename = options.rename || renameSync;
+  const validate = options.validate || validateDataRoot;
+  const remove = options.remove || rmSync;
+  let restoring = false;
+  let ownedStaging = null;
+
+  function list() {
+    return discoverDataSnapshots(dataRoot).map(({ summary }) => summary);
+  }
+
+  function restore(snapshotId) {
+    if (restoring) {
+      throw createStatusError("A data restore is already in progress.", 423, "restore-locked");
+    }
+    if (typeof snapshotId !== "string" || !SNAPSHOT_ID_PATTERN.test(snapshotId)) {
+      throw createStatusError("Snapshot ID is invalid.", 400, "invalid-snapshot-id");
+    }
+    let candidate;
+    try {
+      candidate = discoverDataSnapshots(dataRoot)
+        .find(({ summary }) => summary.id === snapshotId);
+    } catch {
+      throw createStatusError(
+        "Snapshots could not be scanned.",
+        500,
+        "snapshot-scan-failed"
+      );
+    }
+    if (!candidate) {
+      throw createStatusError("Snapshot is no longer available.", 404, "snapshot-not-found");
+    }
+    if (!candidate.summary.valid) {
+      throw createStatusError("Snapshot is not valid for restore.", 409, "snapshot-invalid");
+    }
+
+    let token;
+    try {
+      token = validateToken(tokenFactory());
+    } catch (error) {
+      if (error.code === "invalid-restore-token") {
+        throw error;
+      }
+      throw createStatusError(
+        "A restore token could not be created.",
+        500,
+        "restore-token-failed"
+      );
+    }
+    const stagingRoot = path.join(
+      path.dirname(dataRoot),
+      `.${path.basename(dataRoot)}.restore-${token}`
+    );
+    if (existsSync(stagingRoot)) {
+      throw createStatusError(
+        "Restore staging is already in use.",
+        409,
+        "restore-staging-exists"
+      );
+    }
+    restoring = true;
+    ownedStaging = stagingRoot;
+
+    let transactionFailed = false;
+    let backupRoot;
+    try {
+      try {
+        copy(candidate.candidateRoot, stagingRoot, {
+          errorOnExist: true,
+          force: false,
+          recursive: true
+        });
+      } catch {
+        throw createStatusError(
+          "The selected snapshot could not be staged.",
+          500,
+          "restore-copy-failed"
+        );
+      }
+
+      try {
+        assertRegularTree(stagingRoot);
+        validate(stagingRoot);
+      } catch {
+        throw createStatusError(
+          "The staged snapshot is not valid for restore.",
+          409,
+          "restore-staging-invalid"
+        );
+      }
+
+      try {
+        backupRoot = findAvailablePath(
+          `${dataRoot}.pre-restore-${formatTimestamp(now())}`
+        );
+      } catch {
+        throw createStatusError(
+          "A pre-restore backup location could not be reserved.",
+          500,
+          "restore-backup-reservation-failed"
+        );
+      }
+
+      try {
+        rename(dataRoot, backupRoot);
+      } catch {
+        throw createStatusError(
+          "Current data could not be reserved for restore.",
+          500,
+          "restore-backup-failed"
+        );
+      }
+
+      try {
+        rename(stagingRoot, dataRoot);
+      } catch {
+        try {
+          rename(backupRoot, dataRoot);
+        } catch {
+          throw createStatusError(
+            "Restore publication failed and the previous data could not be restored. Manual recovery is required.",
+            500,
+            "restore-rollback-failed"
+          );
+        }
+        throw createStatusError(
+          "Restore publication failed. The previous data was restored.",
+          500,
+          "restore-publish-failed"
+        );
+      }
+
+      ownedStaging = null;
+      let registry;
+      try {
+        registry = validate(dataRoot);
+      } catch {
+        const quarantineRoot = findAvailablePath(`${dataRoot}.failed-restore-${token}`);
+        try {
+          rename(dataRoot, quarantineRoot);
+        } catch {
+          throw createStatusError(
+            "Restored data failed final validation and could not be quarantined. Manual recovery is required.",
+            500,
+            "restore-quarantine-failed"
+          );
+        }
+        try {
+          rename(backupRoot, dataRoot);
+        } catch {
+          throw createStatusError(
+            "Restored data failed final validation and the previous data could not be restored. Manual recovery is required.",
+            500,
+            "restore-rollback-failed"
+          );
+        }
+        throw createStatusError(
+          "Restored data failed final validation. The previous data was restored and the failed publication was quarantined.",
+          500,
+          "restore-final-validation-failed"
+        );
+      }
+
+      return {
+        registry,
+        preRestoreBackup: path.basename(backupRoot)
+      };
+    } catch (error) {
+      transactionFailed = true;
+      throw error;
+    } finally {
+      restoring = false;
+      if (ownedStaging) {
+        try {
+          removeOwnedStaging();
+        } catch {
+          throw createStatusError(
+            transactionFailed
+              ? "Restore failed and temporary staging could not be cleaned up. Manual cleanup is required."
+              : "Temporary restore staging could not be cleaned up.",
+            500,
+            "restore-cleanup-failed"
+          );
+        }
+      }
+    }
+  }
+
+  function dispose() {
+    if (!restoring && ownedStaging) {
+      try {
+        removeOwnedStaging();
+      } catch {
+        throw createStatusError(
+          "Temporary restore staging could not be cleaned up.",
+          500,
+          "restore-cleanup-failed"
+        );
+      }
+    }
+  }
+
+  function removeOwnedStaging() {
+    remove(ownedStaging, { force: true, recursive: true });
+    ownedStaging = null;
+  }
+
+  function isRestoring() {
+    return restoring;
+  }
+
+  return { list, restore, dispose, isRestoring };
+}
+
+function discoverDataSnapshots(dataRootOption) {
+  const dataRoot = path.resolve(dataRootOption);
   const parentDir = path.dirname(dataRoot);
   const dataBasename = path.basename(dataRoot);
   const snapshotPattern = new RegExp(
@@ -35,6 +266,7 @@ export function listDataSnapshots(options) {
     } catch {
       candidates.push({
         basename: candidateBasename,
+        candidateRoot,
         timestamp: parsed.timestamp,
         summary: {
           ...summary,
@@ -51,6 +283,7 @@ export function listDataSnapshots(options) {
       const activeResume = registry.items.find(({ id }) => id === registry.activeId);
       candidates.push({
         basename: candidateBasename,
+        candidateRoot,
         timestamp: parsed.timestamp,
         summary: {
           ...summary,
@@ -64,6 +297,7 @@ export function listDataSnapshots(options) {
     } catch {
       candidates.push({
         basename: candidateBasename,
+        candidateRoot,
         timestamp: parsed.timestamp,
         summary: {
           ...summary,
@@ -82,8 +316,7 @@ export function listDataSnapshots(options) {
         return timestampOrder;
       }
       return compareStrings(left.basename, right.basename);
-    })
-    .map(({ summary }) => summary);
+    });
 }
 
 function parseSnapshotBasename(basename, pattern) {
@@ -157,4 +390,34 @@ function compareStrings(left, right) {
     return 1;
   }
   return 0;
+}
+
+function formatTimestamp(date) {
+  const iso = date.toISOString();
+  return `${iso.slice(0, 10).replaceAll("-", "")}-${iso.slice(11, 19).replaceAll(":", "")}`;
+}
+
+function findAvailablePath(basePath) {
+  if (!existsSync(basePath)) {
+    return basePath;
+  }
+  let suffix = 2;
+  while (existsSync(`${basePath}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${basePath}-${suffix}`;
+}
+
+function validateToken(token) {
+  if (typeof token !== "string" || !TOKEN_PATTERN.test(token)) {
+    throw createStatusError("Restore token is invalid.", 500, "invalid-restore-token");
+  }
+  return token;
+}
+
+function createStatusError(message, statusCode, code) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
 }

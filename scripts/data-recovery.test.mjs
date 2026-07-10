@@ -2,8 +2,13 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -13,7 +18,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { listDataSnapshots } from "./data-recovery.mjs";
+import { validateDataRoot } from "./data-root.mjs";
+import { createDataRecoveryManager, listDataSnapshots } from "./data-recovery.mjs";
 import { saveResumeYaml } from "./resume-data.mjs";
 
 const fixtureResume = {
@@ -86,6 +92,412 @@ function writeSnapshot(dataRoot, suffix, options) {
 function snapshotId(basename) {
   return createHash("sha256").update(basename).digest("hex");
 }
+
+function captureError(action) {
+  let captured;
+  try {
+    action();
+  } catch (error) {
+    captured = error;
+  }
+  assert.ok(captured, "Expected action to throw");
+  return captured;
+}
+
+test("restores a snapshot through a staged transaction without consuming its source", (t) => {
+  const { dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const sourceBefore = readFileSync(path.join(source.rootDir, "assets/photo.svg"));
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "restore-token"
+  });
+  const [snapshot] = manager.list();
+
+  const result = manager.restore(snapshot.id);
+
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>selected-source</svg>"
+  );
+  assert.equal(existsSync(source.rootDir), true);
+  assert.deepEqual(readFileSync(path.join(source.rootDir, "assets/photo.svg")), sourceBefore);
+  assert.equal(result.preRestoreBackup, `${path.basename(dataRoot)}.pre-restore-20260711-080910`);
+  assert.equal(path.isAbsolute(result.preRestoreBackup), false);
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.equal(
+    readFileSync(
+      path.join(path.dirname(dataRoot), result.preRestoreBackup, "assets/photo.svg"),
+      "utf8"
+    ),
+    "<svg>official-before</svg>"
+  );
+
+  const restoredAgain = manager.restore(snapshot.id);
+  assert.equal(existsSync(source.rootDir), true);
+  assert.deepEqual(readFileSync(path.join(source.rootDir, "assets/photo.svg")), sourceBefore);
+  assert.equal(restoredAgain.preRestoreBackup, `${path.basename(dataRoot)}.pre-restore-20260711-080910-2`);
+});
+
+test("preserves an existing pre-restore timestamp path and uses the next suffix", (t) => {
+  const { dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const reservedBackup = `${dataRoot}.pre-restore-20260711-080910`;
+  mkdirSync(reservedBackup);
+  writeFileSync(path.join(reservedBackup, "sentinel.txt"), "do not overwrite");
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "collision-token"
+  });
+
+  const result = manager.restore(snapshotId(source.basename));
+
+  assert.equal(result.preRestoreBackup, `${path.basename(reservedBackup)}-2`);
+  assert.equal(readFileSync(path.join(reservedBackup, "sentinel.txt"), "utf8"), "do not overwrite");
+  assert.equal(
+    readFileSync(path.join(`${reservedBackup}-2`, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+});
+
+test("rejects malformed and unknown snapshot IDs without filesystem writes", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "unused-token"
+  });
+  const initialEntries = readdirSync(parent).sort();
+  const officialBefore = readFileSync(path.join(dataRoot, "resumes.json"));
+  const sourceBefore = readFileSync(path.join(source.rootDir, "resumes.json"));
+
+  for (const invalidId of [null, "", "A".repeat(64), "a".repeat(63), "../snapshot"]) {
+    const error = captureError(() => manager.restore(invalidId));
+    assert.equal(error.statusCode, 400);
+    assert.equal(error.message.includes(parent), false);
+    assert.equal(manager.isRestoring(), false);
+  }
+  const unknown = captureError(() => manager.restore("f".repeat(64)));
+  assert.equal(unknown.statusCode, 404);
+  assert.equal(unknown.message.includes(parent), false);
+  assert.equal(manager.isRestoring(), false);
+  assert.deepEqual(readdirSync(parent).sort(), initialEntries);
+  assert.deepEqual(readFileSync(path.join(dataRoot, "resumes.json")), officialBefore);
+  assert.deepEqual(readFileSync(path.join(source.rootDir, "resumes.json")), sourceBefore);
+});
+
+test("rescans before restore and rejects removed or newly invalid snapshots without writes", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const removedSource = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const invalidSource = writeSnapshot(dataRoot, "pre-restore-20260710-080910");
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "unused-token"
+  });
+  const listed = manager.list();
+  const removed = listed.find(({ id }) => id === snapshotId(removedSource.basename));
+  const invalid = listed.find(({ id }) => id === snapshotId(invalidSource.basename));
+  rmSync(removedSource.rootDir, { recursive: true });
+  writeFileSync(path.join(invalidSource.rootDir, "resumes.json"), "{broken\n");
+  const entriesBefore = readdirSync(parent).sort();
+  const officialBefore = readFileSync(path.join(dataRoot, "resumes.json"));
+
+  const removedError = captureError(() => manager.restore(removed.id));
+  assert.equal(removedError.statusCode, 404);
+  assert.equal(removedError.message.includes(parent), false);
+  const invalidError = captureError(() => manager.restore(invalid.id));
+  assert.equal(invalidError.statusCode, 409);
+  assert.equal(invalidError.message.includes(parent), false);
+  assert.equal(manager.isRestoring(), false);
+  assert.deepEqual(readdirSync(parent).sort(), entriesBefore);
+  assert.deepEqual(readFileSync(path.join(dataRoot, "resumes.json")), officialBefore);
+});
+
+test("reports restoring only inside transaction callbacks and dispose cannot remove active staging", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const unrelatedStaging = path.join(parent, `.${path.basename(dataRoot)}.restore-not-owned`);
+  mkdirSync(unrelatedStaging);
+  let manager;
+  let selectedId;
+  manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "lifecycle-token",
+    copy(sourceRoot, stagingRoot, options) {
+      assert.equal(manager.isRestoring(), true);
+      cpSync(sourceRoot, stagingRoot, options);
+      manager.dispose();
+      assert.equal(existsSync(stagingRoot), true);
+      assert.equal(existsSync(unrelatedStaging), true);
+      const locked = captureError(() => manager.restore(selectedId));
+      assert.equal(locked.statusCode, 423);
+    },
+    validate(rootDir) {
+      assert.equal(manager.isRestoring(), true);
+      return validateDataRoot(rootDir);
+    }
+  });
+  [selectedId] = manager.list().map(({ id }) => id);
+  assert.equal(manager.isRestoring(), false);
+
+  manager.restore(selectedId);
+
+  assert.equal(manager.isRestoring(), false);
+  assert.equal(existsSync(unrelatedStaging), true);
+  assert.equal(existsSync(dataRoot), true);
+  manager.dispose();
+  assert.equal(existsSync(dataRoot), true);
+  assert.equal(existsSync(unrelatedStaging), true);
+});
+
+test("restore cleans only owned staging when copy or staging validation fails", (t) => {
+  for (const failure of ["copy", "validation"]) {
+    const { parent, dataRoot } = makeDataRoot(t);
+    writeFileSync(path.join(dataRoot, "assets/photo.svg"), `<svg>official-${failure}</svg>`);
+    const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+    const otherSnapshot = writeSnapshot(dataRoot, "pre-restore-20260710-080910");
+    writeFileSync(path.join(source.rootDir, "assets/photo.svg"), `<svg>source-${failure}</svg>`);
+    const officialBefore = readFileSync(path.join(dataRoot, "assets/photo.svg"));
+    const sourceBefore = readFileSync(path.join(source.rootDir, "assets/photo.svg"));
+    const otherBefore = readFileSync(path.join(otherSnapshot.rootDir, "resumes.json"));
+    const entriesBefore = readdirSync(parent).sort();
+    const token = `${failure}-failure-token`;
+    const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-${token}`);
+    const removeCalls = [];
+    const options = {
+      dataRoot,
+      tokenFactory: () => token,
+      remove(target, removeOptions) {
+        removeCalls.push({ target, options: removeOptions });
+        rmSync(target, removeOptions);
+      }
+    };
+    if (failure === "copy") {
+      options.copy = (sourceRoot, targetRoot, copyOptions) => {
+        cpSync(sourceRoot, targetRoot, copyOptions);
+        throw new Error(`copy failed at ${parent}`);
+      };
+    } else {
+      options.validate = (rootDir) => {
+        if (rootDir === stagingRoot) {
+          throw new Error(`staging validation failed at ${parent}`);
+        }
+        return validateDataRoot(rootDir);
+      };
+    }
+    const manager = createDataRecoveryManager(options);
+
+    const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+    assert.equal(
+      error.code,
+      failure === "copy" ? "restore-copy-failed" : "restore-staging-invalid"
+    );
+    assert.equal(error.message.includes(parent), false);
+    assert.equal(manager.isRestoring(), false);
+    assert.deepEqual(readdirSync(parent).sort(), entriesBefore);
+    assert.deepEqual(readFileSync(path.join(dataRoot, "assets/photo.svg")), officialBefore);
+    assert.deepEqual(readFileSync(path.join(source.rootDir, "assets/photo.svg")), sourceBefore);
+    assert.deepEqual(readFileSync(path.join(otherSnapshot.rootDir, "resumes.json")), otherBefore);
+    assert.deepEqual(removeCalls, [{
+      target: stagingRoot,
+      options: { force: true, recursive: true }
+    }]);
+  }
+});
+
+test("restore rolls back the old root when publishing staging fails", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-publish-token`);
+  const removeCalls = [];
+  let renameCalls = 0;
+  let manager;
+  manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "publish-token",
+    rename(sourceRoot, targetRoot) {
+      renameCalls += 1;
+      assert.equal(manager.isRestoring(), true);
+      if (renameCalls === 2) {
+        throw new Error(`publish failed at ${parent}`);
+      }
+      renameSync(sourceRoot, targetRoot);
+    },
+    remove(target, options) {
+      removeCalls.push(target);
+      rmSync(target, options);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.code, "restore-publish-failed");
+  assert.match(error.message, /publication failed.*previous data was restored/i);
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(renameCalls, 3);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(existsSync(`${dataRoot}.pre-restore-20260711-080910`), false);
+  assert.equal(existsSync(source.rootDir), true);
+  assert.deepEqual(removeCalls, [stagingRoot]);
+  assert.equal(manager.isRestoring(), false);
+});
+
+test("restore quarantines a failed final publication uniquely and restores the old root", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const existingQuarantine = `${dataRoot}.failed-restore-final-token`;
+  mkdirSync(existingQuarantine);
+  writeFileSync(path.join(existingQuarantine, "sentinel.txt"), "existing quarantine");
+  const removeCalls = [];
+  let validationCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "final-token",
+    validate(rootDir) {
+      validationCalls += 1;
+      if (rootDir === dataRoot) {
+        throw new Error(`final validation failed at ${parent}`);
+      }
+      return validateDataRoot(rootDir);
+    },
+    remove(target, options) {
+      removeCalls.push(target);
+      rmSync(target, options);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.code, "restore-final-validation-failed");
+  assert.match(error.message, /final validation.*previous data was restored.*quarantined/i);
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(validationCalls, 2);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(`${existingQuarantine}-2`, "assets/photo.svg"), "utf8"),
+    "<svg>selected-source</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(existingQuarantine, "sentinel.txt"), "utf8"),
+    "existing quarantine"
+  );
+  assert.equal(existsSync(`${dataRoot}.pre-restore-20260711-080910`), false);
+  assert.equal(existsSync(source.rootDir), true);
+  assert.deepEqual(removeCalls, []);
+  assert.equal(manager.isRestoring(), false);
+});
+
+test("restore rollback failure preserves every surviving root and reports manual recovery", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-rollback-token`);
+  const removeCalls = [];
+  let renameCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "rollback-token",
+    rename(sourceRoot, targetRoot) {
+      renameCalls += 1;
+      if (renameCalls === 1) {
+        renameSync(sourceRoot, targetRoot);
+        return;
+      }
+      if (renameCalls === 2) {
+        mkdirSync(dataRoot);
+        writeFileSync(path.join(dataRoot, "survivor.txt"), "new official survivor");
+        throw new Error(`publish failed at ${parent}`);
+      }
+      throw new Error(`rollback failed at ${parent}`);
+    },
+    remove(target, options) {
+      removeCalls.push(target);
+      rmSync(target, options);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.code, "restore-rollback-failed");
+  assert.match(error.message, /previous data could not be restored.*manual recovery/i);
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(renameCalls, 3);
+  assert.equal(readFileSync(path.join(dataRoot, "survivor.txt"), "utf8"), "new official survivor");
+  assert.equal(
+    readFileSync(path.join(backupRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(source.rootDir, "assets/photo.svg"), "utf8"),
+    "<svg>selected-source</svg>"
+  );
+  assert.deepEqual(removeCalls, [stagingRoot]);
+  assert.equal(manager.isRestoring(), false);
+});
+
+test("restore rejects unsafe tokens and never claims an existing staging directory", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const initialEntries = readdirSync(parent).sort();
+  const unsafeManager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "../escape"
+  });
+
+  const unsafeError = captureError(() => unsafeManager.restore(snapshotId(source.basename)));
+
+  assert.equal(unsafeError.code, "invalid-restore-token");
+  assert.equal(unsafeError.message.includes(parent), false);
+  assert.deepEqual(readdirSync(parent).sort(), initialEntries);
+  assert.equal(unsafeManager.isRestoring(), false);
+
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-existing-token`);
+  mkdirSync(stagingRoot);
+  writeFileSync(path.join(stagingRoot, "sentinel.txt"), "not manager owned");
+  const removeCalls = [];
+  const existingManager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "existing-token",
+    remove(target, options) {
+      removeCalls.push(target);
+      rmSync(target, options);
+    }
+  });
+
+  const existingError = captureError(
+    () => existingManager.restore(snapshotId(source.basename))
+  );
+  assert.equal(existingError.code, "restore-staging-exists");
+  assert.equal(existingError.message.includes(parent), false);
+  existingManager.dispose();
+  assert.equal(readFileSync(path.join(stagingRoot, "sentinel.txt"), "utf8"), "not manager owned");
+  assert.deepEqual(removeCalls, []);
+  assert.equal(existsSync(dataRoot), true);
+  assert.equal(existsSync(source.rootDir), true);
+});
 
 test("discovers both snapshot types with newest-first timestamps and registry metadata", (t) => {
   const { dataRoot } = makeDataRoot(t);
