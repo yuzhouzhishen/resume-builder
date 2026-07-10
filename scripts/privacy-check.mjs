@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -18,9 +17,12 @@ const ALLOWED_EMAIL_DOMAINS = new Set([
   "example.com",
   "users.noreply.github.com"
 ]);
+const ALLOWED_EMAILS = new Set(["noreply@github.com"]);
 const MAX_TEXT_BLOB_BYTES = 2 * 1024 * 1024;
+const BLOB_BATCH_SIZE = 32;
 
 function isAllowedEmail(email) {
+  if (ALLOWED_EMAILS.has(email.toLowerCase())) return true;
   const domain = email.slice(email.lastIndexOf("@") + 1).toLowerCase();
   return ALLOWED_EMAIL_DOMAINS.has(domain);
 }
@@ -99,7 +101,7 @@ export function findTextViolations(text, { source = "<text>" } = {}) {
       }
     }
 
-    if (/(?:^|\D)1[3-9]\d{9}(?!\d)/.test(lineText)) {
+    if (/(?:^|\D)(?:\+?86[\s-]?)?1[3-9]\d[\s-]?\d{4}[\s-]?\d{4}(?!\d)/.test(lineText)) {
       violations.push(textViolation("mobile-phone", source, line));
     }
 
@@ -135,9 +137,25 @@ function withScope(violations, scope, extra = {}) {
   return violations.map((violation) => ({ ...violation, scope, ...extra }));
 }
 
-function readTrackedPaths(root) {
-  const output = git(root, ["ls-files", "-z"]);
-  return output.split("\0").filter(Boolean);
+function objectContentViolation(rule, { filePath, scope }, objectId) {
+  return {
+    rule,
+    source: filePath,
+    scope,
+    objectId,
+    message: `${filePath}: forbidden tracked content (${rule})`
+  };
+}
+
+function readTrackedEntries(root) {
+  const output = git(root, ["ls-files", "--stage", "-z"]);
+  return output.split("\0").filter(Boolean).flatMap((record) => {
+    const separator = record.indexOf("\t");
+    if (separator === -1) return [];
+    const [mode, objectId, stage] = record.slice(0, separator).split(" ");
+    if (stage !== "0" || /^0+$/.test(objectId)) return [];
+    return [{ mode, objectId, filePath: record.slice(separator + 1) }];
+  });
 }
 
 function readHistoryObjects(root) {
@@ -149,6 +167,18 @@ function readHistoryObjects(root) {
     if (separator === -1) return [];
     return [{ objectId: line.slice(0, separator), filePath: line.slice(separator + 1) }];
   });
+}
+
+function readHistoryPaths(root) {
+  const output = git(root, [
+    "log",
+    "--all",
+    "--name-only",
+    "--format=",
+    "--no-renames",
+    "-z"
+  ]);
+  return output.split("\0").filter(Boolean);
 }
 
 function readCommitViolations(root) {
@@ -172,15 +202,66 @@ function readCommitViolations(root) {
   return violations;
 }
 
-function readBlobText(root, objectId) {
-  if (git(root, ["cat-file", "-t", objectId]).trim() !== "blob") return null;
+function chunk(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
 
-  const size = Number(git(root, ["cat-file", "-s", objectId]).trim());
-  if (!Number.isSafeInteger(size) || size > MAX_TEXT_BLOB_BYTES) return null;
+function readObjectMetadata(root, objectIds) {
+  if (objectIds.length === 0) return new Map();
+  const output = git(
+    root,
+    ["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+    { input: `${objectIds.join("\n")}\n` }
+  );
+  const metadata = new Map();
 
-  const buffer = git(root, ["cat-file", "blob", objectId], { encoding: null });
-  if (buffer.includes(0)) return null;
-  return buffer.toString("utf8");
+  for (const line of output.trim().split("\n")) {
+    const [objectId, type, sizeText] = line.split(" ");
+    const size = Number(sizeText);
+    metadata.set(objectId, { type, size });
+  }
+
+  return metadata;
+}
+
+function parseBlobBatch(output) {
+  const blobs = new Map();
+  let offset = 0;
+
+  while (offset < output.length) {
+    const headerEnd = output.indexOf(10, offset);
+    if (headerEnd === -1) break;
+    const [objectId, type, sizeText] = output.subarray(offset, headerEnd).toString("utf8").split(" ");
+    const size = Number(sizeText);
+    if (type !== "blob" || !Number.isSafeInteger(size)) break;
+    const contentStart = headerEnd + 1;
+    const contentEnd = contentStart + size;
+    blobs.set(objectId, Buffer.from(output.subarray(contentStart, contentEnd)));
+    offset = contentEnd + 1;
+  }
+
+  return blobs;
+}
+
+function readBlobContents(root, objectIds) {
+  const blobs = new Map();
+
+  for (const objectIdChunk of chunk(objectIds, BLOB_BATCH_SIZE)) {
+    const output = git(root, ["cat-file", "--batch"], {
+      encoding: null,
+      input: `${objectIdChunk.join("\n")}\n`,
+      maxBuffer: objectIdChunk.length * (MAX_TEXT_BLOB_BYTES + 256)
+    });
+    for (const [objectId, buffer] of parseBlobBatch(output)) {
+      blobs.set(objectId, buffer);
+    }
+  }
+
+  return blobs;
 }
 
 function deduplicateViolations(violations) {
@@ -202,47 +283,69 @@ function deduplicateViolations(violations) {
 
 export function scanRepository(root = process.cwd()) {
   const repositoryRoot = path.resolve(root);
-  const trackedPaths = readTrackedPaths(repositoryRoot);
+  const trackedEntries = readTrackedEntries(repositoryRoot);
+  const trackedPaths = trackedEntries.map(({ filePath }) => filePath);
   const historyObjects = readHistoryObjects(repositoryRoot);
+  const historyPaths = readHistoryPaths(repositoryRoot);
   const violations = [
     ...withScope(findPathViolations(trackedPaths), "current"),
-    ...withScope(
-      findPathViolations(historyObjects.map(({ filePath }) => filePath)),
-      "history"
-    ),
+    ...withScope(findPathViolations(historyPaths), "history"),
     ...readCommitViolations(repositoryRoot)
   ];
 
-  for (const filePath of trackedPaths) {
-    const text = readFileSync(path.join(repositoryRoot, filePath), "utf8");
-    violations.push(...withScope(
-      findTextViolations(text, { source: filePath }),
-      "current"
-    ));
+  const objectSources = new Map();
+  for (const { objectId, filePath } of trackedEntries) {
+    if (!objectSources.has(objectId)) {
+      objectSources.set(objectId, { filePath, scope: "current" });
+    }
   }
-
-  const uniqueHistoryObjects = new Map();
-  for (const entry of historyObjects) {
-    if (!uniqueHistoryObjects.has(entry.objectId)) {
-      uniqueHistoryObjects.set(entry.objectId, entry.filePath);
+  for (const { objectId, filePath } of historyObjects) {
+    if (!objectSources.has(objectId)) {
+      objectSources.set(objectId, { filePath, scope: "history" });
     }
   }
 
-  for (const [objectId, filePath] of uniqueHistoryObjects) {
-    const text = readBlobText(repositoryRoot, objectId);
-    if (text === null) continue;
+  const objectIds = [...objectSources.keys()];
+  const metadata = readObjectMetadata(repositoryRoot, objectIds);
+  for (const [objectId, source] of objectSources) {
+    const object = metadata.get(objectId);
+    if (object?.type === "blob" && object.size > MAX_TEXT_BLOB_BYTES) {
+      violations.push(objectContentViolation("oversized-content", source, objectId));
+    }
+  }
+  const textBlobIds = objectIds.filter((objectId) => {
+    const object = metadata.get(objectId);
+    return object?.type === "blob" && object.size <= MAX_TEXT_BLOB_BYTES;
+  });
+  const blobs = readBlobContents(repositoryRoot, textBlobIds);
+
+  for (const [objectId, buffer] of blobs) {
+    const { filePath, scope } = objectSources.get(objectId);
+    if (buffer.includes(0)) {
+      violations.push(objectContentViolation(
+        "binary-content",
+        { filePath, scope },
+        objectId
+      ));
+      continue;
+    }
     violations.push(...withScope(
-      findTextViolations(text, { source: filePath }),
-      "history",
+      findTextViolations(buffer.toString("utf8"), { source: filePath }),
+      scope,
       { objectId }
     ));
   }
+
+  const historyObjectIds = new Set(historyObjects.map(({ objectId }) => objectId));
+  const historyBlobCount = [...historyObjectIds].filter(
+    (objectId) => metadata.get(objectId)?.type === "blob"
+  ).length;
 
   return {
     violations: deduplicateViolations(violations),
     stats: {
       trackedPathCount: trackedPaths.length,
-      historyBlobCount: uniqueHistoryObjects.size,
+      historyBlobCount,
       commitCount: Number(git(repositoryRoot, ["rev-list", "--count", "--all"]).trim())
     }
   };

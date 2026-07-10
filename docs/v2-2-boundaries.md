@@ -29,6 +29,7 @@ npm run ci
 - 栅格照片、简历文档及内部 UI 审核截图目录。
 - 常见私钥、访问令牌、非示例邮箱、中国大陆手机号和非测试用户的绝对主目录。
 - 非 `example.com` 或 GitHub noreply 的 Git 提交邮箱。
+- 无论扩展名如何，任何二进制 blob 或超过 2MB 的跟踪 blob。
 
 仓库允许源代码、文档、虚构 YAML 样例、`.env.example`、`output/.gitkeep` 和 `assets/photo.svg` 矢量占位头像。
 

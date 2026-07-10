@@ -111,6 +111,23 @@ test("Windows user home paths are rejected", () => {
   assert.equal(violations.some(({ rule }) => rule === "absolute-home-path"), true);
 });
 
+test("formatted mainland mobile numbers are rejected", () => {
+  const variants = [
+    ["138", "1234", "5678"].join("-"),
+    ["138", "1234", "5678"].join(" "),
+    ["+86", "138", "1234", "5678"].join(" ")
+  ];
+
+  for (const value of variants) {
+    const violations = findTextViolations(value, { source: "fixture.txt" });
+    assert.equal(
+      violations.some(({ rule }) => rule === "mobile-phone"),
+      true,
+      `expected formatted mobile variant ${variants.indexOf(value) + 1} to be rejected`
+    );
+  }
+});
+
 test("a clean repository and its safe history pass", () => {
   const root = makeRepository();
   writeFileSync(path.join(root, "README.md"), "candidate@example.com\n");
@@ -137,6 +154,43 @@ test("a private path remains rejected after deletion from the current tree", () 
   assert.equal(result.violations.some(({ scope }) => scope === "history"), true);
 });
 
+test("history rejects a private path that reused an existing public blob", () => {
+  const root = makeRepository();
+  const sharedContent = "public fixture\n";
+  writeFileSync(path.join(root, "README.md"), sharedContent);
+  commitAll(root, "Add public blob");
+  mkdirSync(path.join(root, "resumes"));
+  writeFileSync(path.join(root, "resumes", "private.yaml"), sharedContent);
+  commitAll(root, "Reuse blob at forbidden path");
+  rmSync(path.join(root, "resumes"), { recursive: true });
+  commitAll(root, "Remove reused path");
+
+  const result = scanRepository(root);
+
+  assert.equal(
+    result.violations.some(({ rule, scope }) => rule === "private-path" && scope === "history"),
+    true
+  );
+});
+
+test("current scan reads staged content instead of an unstaged worktree replacement", () => {
+  const root = makeRepository();
+  const filePath = path.join(root, "README.md");
+  writeFileSync(filePath, "candidate@example.com\n");
+  commitAll(root, "Add safe fixture");
+  const personalEmail = ["person", "mail.example"].join("@");
+  writeFileSync(filePath, `${personalEmail}\n`);
+  git(root, "add", "README.md");
+  writeFileSync(filePath, "candidate@example.com\n");
+
+  const result = scanRepository(root);
+
+  assert.equal(
+    result.violations.some(({ rule, scope }) => rule === "personal-email" && scope === "current"),
+    true
+  );
+});
+
 test("personal commit metadata email is rejected", () => {
   const email = ["person", "mail.example"].join("@");
   const root = makeRepository({ email });
@@ -147,6 +201,28 @@ test("personal commit metadata email is rejected", () => {
 
   assert.equal(result.violations.some(({ rule }) => rule === "commit-email"), true);
   assert.equal(result.violations.some(({ message }) => message.includes(email)), false);
+});
+
+test("GitHub generated noreply commit metadata is allowed", () => {
+  const root = makeRepository({ email: "noreply@github.com" });
+  writeFileSync(path.join(root, "README.md"), "public fixture\n");
+  commitAll(root, "GitHub merge fixture");
+
+  const result = scanRepository(root);
+
+  assert.equal(result.violations.some(({ rule }) => rule === "commit-email"), false);
+});
+
+test("extensionless binary and oversized text blobs are rejected", () => {
+  const root = makeRepository();
+  writeFileSync(path.join(root, "payload"), Buffer.from([0, 1, 2, 3]));
+  writeFileSync(path.join(root, "large.txt"), "x".repeat(2 * 1024 * 1024 + 1));
+  commitAll(root, "Add opaque fixtures");
+
+  const result = scanRepository(root);
+
+  assert.equal(result.violations.some(({ rule }) => rule === "binary-content"), true);
+  assert.equal(result.violations.some(({ rule }) => rule === "oversized-content"), true);
 });
 
 test("package scripts run privacy checks locally and in CI", () => {
