@@ -5,13 +5,13 @@ import {
   cpSync,
   existsSync,
   fstatSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
   renameSync,
-  rmdirSync,
   rmSync,
   unlinkSync,
   writeFileSync
@@ -24,6 +24,7 @@ const INVALID_DATA_REASON = "Snapshot data is invalid.";
 const UNSAFE_TREE_REASON = "Snapshot contains an unsafe filesystem entry.";
 const SNAPSHOT_ID_PATTERN = /^[a-f0-9]{64}$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/;
+const DEFAULT_INVALID_LOCK_STALE_MS = 5 * 60 * 1000;
 
 export function listDataSnapshots(options) {
   return discoverDataSnapshots(options.dataRoot).map(({ summary }) => summary);
@@ -33,18 +34,20 @@ export function createDataRecoveryManager(options) {
   const dataRoot = path.resolve(options.dataRoot);
   const parentDir = path.dirname(dataRoot);
   const dataBasename = path.basename(dataRoot);
-  const lockRoot = path.join(parentDir, `.${dataBasename}.recovery-lock`);
+  const lockPath = path.join(parentDir, `.${dataBasename}.recovery-lock`);
   const now = options.now || (() => new Date());
   const tokenFactory = options.tokenFactory || randomUUID;
   const lockTokenFactory = options.lockTokenFactory || randomUUID;
   const copy = options.copy || cpSync;
+  const link = options.link || linkSync;
   const mkdir = options.mkdir || mkdirSync;
   const rename = options.rename || renameSync;
-  const rmdir = options.rmdir || rmdirSync;
   const unlink = options.unlink || unlinkSync;
   const validate = options.validate || validateDataRoot;
   const remove = options.remove || rmSync;
   const isProcessAlive = options.isProcessAlive || processIsAlive;
+  const lockNow = options.lockNow || Date.now;
+  const invalidLockStaleMs = options.invalidLockStaleMs ?? DEFAULT_INVALID_LOCK_STALE_MS;
   let restoring = false;
   let ownedStaging = null;
   let ownedLock = null;
@@ -221,7 +224,9 @@ export function createDataRecoveryManager(options) {
       }
 
       try {
-        assertOwnedDirectory(ownedStaging);
+        if (!verifyOwnedStaging()) {
+          throw new Error("Restore staging ownership changed");
+        }
       } catch {
         throw createStatusError(
           "Restore staging ownership changed before publication.",
@@ -241,7 +246,9 @@ export function createDataRecoveryManager(options) {
       }
 
       try {
-        assertOwnedDirectory(ownedStaging);
+        if (!verifyOwnedStaging()) {
+          throw new Error("Restore staging ownership changed");
+        }
       } catch {
         try {
           rename(backupRoot, dataRoot);
@@ -279,7 +286,9 @@ export function createDataRecoveryManager(options) {
       }
 
       try {
-        assertOwnedDirectory(ownedStaging, dataRoot);
+        if (!verifyOwnedStaging(dataRoot)) {
+          throw new Error("Published restore ownership changed");
+        }
       } catch {
         const quarantineRoot = findAvailablePath(`${dataRoot}.failed-restore-${token}`);
         try {
@@ -430,77 +439,104 @@ export function createDataRecoveryManager(options) {
     }
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const temporaryLockPath = path.join(
+        parentDir,
+        `.${dataBasename}.recovery-lock-${lockToken}-${process.pid}-${attempt + 1}.tmp`
+      );
+      let temporaryOwner = null;
       try {
-        mkdir(lockRoot, { recursive: false, mode: 0o700 });
-      } catch (error) {
-        if (
-          error.code === "EEXIST"
-          && attempt === 0
-          && reclaimStaleRecoveryLock()
-        ) {
-          continue;
-        }
-        if (error.code === "EEXIST") {
-          throw createStatusError(
-            "Another recovery transaction is in progress.",
-            423,
-            "restore-locked"
-          );
-        }
-        throw createStatusError(
-          "The recovery transaction lock could not be acquired.",
-          500,
-          "restore-lock-acquire-failed"
-        );
-      }
-
-      let lockIdentity;
-      try {
-        lockIdentity = readDirectoryIdentity(lockRoot);
         writeFileSync(
-          path.join(lockRoot, "owner.json"),
+          temporaryLockPath,
           `${JSON.stringify({ pid: process.pid, token: lockToken })}\n`,
           { encoding: "utf8", flag: "wx", mode: 0o600 }
         );
-      } catch {
+        temporaryOwner = readLockOwner(temporaryLockPath);
+        if (temporaryOwner.pid !== process.pid || temporaryOwner.token !== lockToken) {
+          throw new Error("Temporary recovery lock metadata changed");
+        }
+
         try {
-          assertDirectoryIdentity(lockRoot, lockIdentity);
-          rmdir(lockRoot);
-        } catch {
-          // Preserve any entry whose ownership can no longer be proven.
+          link(temporaryLockPath, lockPath);
+        } catch (error) {
+          if (
+            error.code === "EEXIST"
+            && attempt === 0
+            && reclaimStaleRecoveryLock()
+          ) {
+            continue;
+          }
+          if (error.code === "EEXIST") {
+            throw createStatusError(
+              "Another recovery transaction is in progress.",
+              423,
+              "restore-locked"
+            );
+          }
+          throw createStatusError(
+            "The recovery transaction lock could not be acquired.",
+            500,
+            "restore-lock-acquire-failed"
+          );
+        }
+
+        const claimedOwner = readLockOwner(lockPath);
+        assertSameLockOwner(temporaryOwner, claimedOwner);
+        ownedLock = {
+          path: lockPath,
+          identity: claimedOwner.identity,
+          pid: process.pid,
+          token: lockToken
+        };
+        return;
+      } catch (error) {
+        if (error.statusCode) {
+          throw error;
         }
         throw createStatusError(
           "The recovery transaction lock could not be initialized.",
           500,
           "restore-lock-acquire-failed"
         );
+      } finally {
+        if (temporaryOwner) {
+          try {
+            const currentOwner = readLockOwner(temporaryLockPath);
+            assertSameLockOwner(temporaryOwner, currentOwner);
+            unlink(temporaryLockPath);
+          } catch {
+            // Never unlink a temporary path after its identity is lost.
+          }
+        }
       }
-
-      ownedLock = {
-        root: lockRoot,
-        identity: lockIdentity,
-        pid: process.pid,
-        token: lockToken
-      };
-      return;
     }
   }
 
   function reclaimStaleRecoveryLock() {
-    let lockIdentity;
-    let owner;
+    let lockStats;
     try {
-      lockIdentity = readDirectoryIdentity(lockRoot);
-      owner = readLockOwner(path.join(lockRoot, "owner.json"));
+      lockStats = lstatSync(lockPath);
+      if (!lockStats.isFile()) {
+        return false;
+      }
+      let owner;
+      try {
+        owner = readLockOwner(lockPath);
+      } catch {
+        if (lockNow() - lockStats.mtimeMs < invalidLockStaleMs) {
+          return false;
+        }
+        if (!matchesFileIdentity(lockPath, lockStats)) {
+          return false;
+        }
+        unlink(lockPath);
+        return true;
+      }
       if (isProcessAlive(owner.pid)) {
         return false;
       }
-      assertDirectoryIdentity(lockRoot, lockIdentity);
-      const currentOwner = readLockOwner(path.join(lockRoot, "owner.json"));
+      const currentOwner = readLockOwner(lockPath);
       assertSameLockOwner(owner, currentOwner);
-      unlink(path.join(lockRoot, "owner.json"));
-      assertDirectoryIdentity(lockRoot, lockIdentity);
-      rmdir(lockRoot);
+      unlink(lockPath);
       return true;
     } catch {
       return false;
@@ -508,23 +544,36 @@ export function createDataRecoveryManager(options) {
   }
 
   function releaseOwnedLock() {
-    assertOwnedDirectory(ownedLock);
-    const ownerPath = path.join(ownedLock.root, "owner.json");
-    const owner = readLockOwner(ownerPath);
+    const owner = readLockOwner(ownedLock.path);
     if (owner.pid !== ownedLock.pid || owner.token !== ownedLock.token) {
       throw new Error("Recovery lock ownership metadata changed");
     }
-    assertOwnedDirectory(ownedLock);
-    unlink(ownerPath);
-    assertOwnedDirectory(ownedLock);
-    rmdir(ownedLock.root);
+    if (
+      owner.identity.dev !== ownedLock.identity.dev
+      || owner.identity.ino !== ownedLock.identity.ino
+    ) {
+      throw new Error("Recovery lock identity changed");
+    }
+    const currentOwner = readLockOwner(ownedLock.path);
+    assertSameLockOwner(owner, currentOwner);
+    unlink(ownedLock.path);
     ownedLock = null;
   }
 
   function removeOwnedStaging() {
-    assertOwnedDirectory(ownedStaging);
+    if (!verifyOwnedStaging()) {
+      return;
+    }
     remove(ownedStaging.root, { force: true, recursive: true });
     ownedStaging = null;
+  }
+
+  function verifyOwnedStaging(rootDir = ownedStaging.root) {
+    if (!matchesOwnedDirectory(ownedStaging, rootDir)) {
+      ownedStaging = null;
+      return false;
+    }
+    return true;
   }
 
   function isRestoring() {
@@ -734,6 +783,37 @@ function assertOwnedDirectory(ownedDirectory, rootDir = ownedDirectory.root) {
   ) {
     throw new Error("Filesystem directory identity changed");
   }
+}
+
+function matchesOwnedDirectory(ownedDirectory, rootDir = ownedDirectory.root) {
+  let stats;
+  try {
+    stats = lstatSync(rootDir);
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+      return false;
+    }
+    throw error;
+  }
+  return (
+    stats.isDirectory()
+    && stats.dev === ownedDirectory.identity.dev
+    && stats.ino === ownedDirectory.identity.ino
+  );
+}
+
+function matchesFileIdentity(filePath, expectedStats) {
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch {
+    return false;
+  }
+  return (
+    stats.isFile()
+    && stats.dev === expectedStats.dev
+    && stats.ino === expectedStats.ino
+  );
 }
 
 function readLockOwner(ownerPath) {
