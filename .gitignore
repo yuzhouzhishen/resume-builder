@@ -1,0 +1,26 @@
+.DS_Store
+node_modules/
+.worktrees/
+.env.local
+
+# Private runtime resume data
+/resumes.json
+/resumes/
+/assets/*
+!/assets/photo.svg
+
+# Generated per-resume artifacts
+output/*
+!output/.gitkeep
+!output/*/
+output/*/*
+!output/*/.gitkeep
+
+# Local resume history
+backups/
+resume.backup.yaml
+
+# Local editor and test artifacts
+playwright-report/
+test-results/
+*.log

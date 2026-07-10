@@ -1,0 +1,3030 @@
+import assert from "node:assert/strict";
+import { once } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { unzipSync } from "fflate";
+import { chromium } from "playwright";
+
+import { createDataPackage } from "./data-package.mjs";
+import { startEditorServer } from "./editor-server.mjs";
+import { renderResumeHtml } from "./generate.mjs";
+import { loadResumeYaml, saveResumeYaml } from "./resume-data.mjs";
+
+const PROJECT_ROOT = path.resolve(".");
+
+function sendTestText(response, statusCode, body, contentType = "text/plain; charset=utf-8") {
+  response.writeHead(statusCode, {
+    "content-type": contentType,
+    "cache-control": "no-store"
+  });
+  response.end(body);
+}
+
+function sendTestJson(response, statusCode, payload) {
+  sendTestText(response, statusCode, JSON.stringify(payload), "application/json; charset=utf-8");
+}
+
+async function readTestJsonBody(request) {
+  const chunks = [];
+  for await (const chunk of request) {
+    chunks.push(chunk);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function sendTestFile(response, filePath, contentType) {
+  response.writeHead(200, {
+    "content-type": contentType,
+    "cache-control": "no-store"
+  });
+  response.end(readFileSync(filePath));
+}
+
+async function startCustomEditorServer(handler) {
+  const server = http.createServer(async (request, response) => {
+    const url = new URL(request.url || "/", "http://127.0.0.1");
+    if (await handler(request, response, url)) {
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/resumes") {
+      sendTestJson(response, 200, {
+        ok: true,
+        activeId: "cpp",
+        resumes: [{ id: "cpp", name: "C++ 应届生", file: "resumes/cpp.yaml" }]
+      });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/") {
+      sendTestFile(response, path.join(PROJECT_ROOT, "editor/index.html"), "text/html; charset=utf-8");
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/editor/app.js") {
+      sendTestFile(response, path.join(PROJECT_ROOT, "editor/app.js"), "text/javascript; charset=utf-8");
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/editor/styles.css") {
+      sendTestFile(response, path.join(PROJECT_ROOT, "editor/styles.css"), "text/css; charset=utf-8");
+      return;
+    }
+
+    if (request.method === "GET" && ["/output/preview.html", "/output/cpp/preview.html"].includes(url.pathname)) {
+      sendTestText(response, 200, renderResumeHtml(validResume, {
+        density: "normal",
+        cssPath: "/templates/resume.css"
+      }), "text/html; charset=utf-8");
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/templates/resume.css") {
+      sendTestFile(response, path.join(PROJECT_ROOT, "templates/resume.css"), "text/css; charset=utf-8");
+      return;
+    }
+
+    sendTestText(response, 404, "Not found");
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    close: () => new Promise((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+      server.closeAllConnections();
+    })
+  };
+}
+
+async function openEditorPage(t, options) {
+  const browser = await chromium.launch();
+  const context = await browser.newContext(options);
+  const page = await context.newPage();
+  t.after(async () => {
+    await browser.close();
+  });
+  return page;
+}
+
+async function waitForResumeOption(page, resumeId) {
+  await page.waitForFunction((id) => Array.from(
+    document.querySelectorAll("#resumeSelectMenu [data-resume-id]")
+  ).some((option) => option.dataset.resumeId === id), resumeId);
+}
+
+async function selectResumeOption(page, resumeId) {
+  await waitForResumeOption(page, resumeId);
+  await page.click("#resumeSelectButton");
+  await page.click(`#resumeSelectMenu [data-resume-id='${resumeId}']`);
+}
+
+async function selectedResumeId(page) {
+  return page.getAttribute("#resumeSelectButton", "data-value");
+}
+
+async function waitForPreviewInteractive(page) {
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    const documentInFrame = iframe?.contentDocument;
+    return documentInFrame?.readyState === "complete"
+      && documentInFrame.querySelector("#resume-page")
+      && documentInFrame.documentElement.dataset.previewInteractive === "true";
+  });
+}
+
+async function dispatchPreviewClick(page, selector) {
+  await waitForPreviewInteractive(page);
+  await page.frameLocator("#previewFrame").locator(selector).evaluate((element) => {
+    element.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true
+    }));
+  });
+}
+
+async function sendPreviewSelection(page, section, path = "") {
+  await page.evaluate(({ section, path }) => {
+    window.dispatchEvent(new MessageEvent("message", {
+      origin: window.location.origin,
+      data: {
+        type: "resume-preview-section",
+        section,
+        path
+      }
+    }));
+  }, { section, path });
+}
+
+async function dispatchBeforeUnload(page) {
+  return page.evaluate(() => {
+    const event = new Event("beforeunload", { cancelable: true });
+    const dispatchResult = window.dispatchEvent(event);
+    return {
+      defaultPrevented: event.defaultPrevented,
+      dispatchResult
+    };
+  });
+}
+
+const validResume = {
+  profile: {
+    name: "测试候选人",
+    target: "C++开发工程师",
+    school: "示例大学（应届生）",
+    major: "计算机科学与技术",
+    phone: "000-0000-0000",
+    email: "candidate@example.com",
+    photo: "assets/photo.svg"
+  },
+  skills: [
+    {
+      title: "C/C++编程",
+      items: ["熟悉 C/C++ 基本语法。"]
+    }
+  ],
+  internships: [],
+  projects: []
+};
+
+async function startPortBlocker() {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(204);
+    response.end();
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  return server;
+}
+
+function makeApiFixture() {
+  const dir = mkdtempSync(path.join(tmpdir(), "resume-editor-test-"));
+  mkdirSync(path.join(dir, "assets"));
+  mkdirSync(path.join(dir, "output"));
+  mkdirSync(path.join(dir, "output/cpp"));
+  mkdirSync(path.join(dir, "resumes"));
+  writeFileSync(path.join(dir, "assets/photo.svg"), "<svg></svg>");
+  writeFileSync(path.join(dir, "assets/photo.png"), "png-photo");
+  writeFileSync(path.join(dir, "output/resume.png"), "png-preview");
+  saveResumeYaml(path.join(dir, "resumes/cpp.yaml"), validResume);
+  writeFileSync(path.join(dir, "resumes.json"), `${JSON.stringify({
+    activeId: "cpp",
+    items: [{ id: "cpp", name: "C++ 应届生", file: "resumes/cpp.yaml" }]
+  }, null, 2)}\n`);
+  return dir;
+}
+
+function resumeYamlPath(rootDir, resumeId = "cpp") {
+  return path.join(rootDir, "resumes", `${resumeId}.yaml`);
+}
+
+function previewHtmlPath(rootDir, resumeId = "cpp") {
+  return path.join(rootDir, "output", resumeId, "preview.html");
+}
+
+function makeProjectFixture() {
+  const projectRoot = mkdtempSync(path.join(tmpdir(), "resume-project-root-test-"));
+  mkdirSync(path.join(projectRoot, "editor"), { recursive: true });
+  mkdirSync(path.join(projectRoot, "templates"), { recursive: true });
+  mkdirSync(path.join(projectRoot, "examples"), { recursive: true });
+  mkdirSync(path.join(projectRoot, "assets"), { recursive: true });
+  writeFileSync(path.join(projectRoot, "editor/index.html"), "<!doctype html><p>project-root-index</p>");
+  writeFileSync(path.join(projectRoot, "editor/app.js"), "// project-root-script");
+  writeFileSync(path.join(projectRoot, "editor/styles.css"), "/* project-root-editor-css */");
+  writeFileSync(path.join(projectRoot, "templates/resume.css"), "/* project-root-resume-css */");
+  writeFileSync(path.join(projectRoot, "assets/photo.svg"), "<svg>public-placeholder</svg>");
+  saveResumeYaml(path.join(projectRoot, "examples/cpp.yaml"), validResume);
+  return projectRoot;
+}
+
+function makeMultiResumeFixture() {
+  const rootDir = makeApiFixture();
+
+  const cppResume = structuredClone(validResume);
+  cppResume.profile.name = "C++ Candidate";
+  const aiResume = structuredClone(validResume);
+  aiResume.profile.name = "AI Candidate";
+  aiResume.profile.target = "AI Agent 应用开发工程师";
+
+  saveResumeYaml(path.join(rootDir, "resumes/cpp.yaml"), cppResume);
+  saveResumeYaml(path.join(rootDir, "resumes/ai-agent.yaml"), aiResume);
+  writeFileSync(path.join(rootDir, "resumes.json"), `${JSON.stringify({
+    activeId: "cpp",
+    items: [
+      { id: "cpp", name: "C++ 应届生", file: "resumes/cpp.yaml" },
+      { id: "ai-agent", name: "AI Agent", file: "resumes/ai-agent.yaml" }
+    ]
+  }, null, 2)}\n`);
+
+  return rootDir;
+}
+
+function resumeWithContentCards() {
+  const resume = structuredClone(validResume);
+  resume.internships = [
+    {
+      start: "2025.08",
+      end: "至今",
+      organization: "示例科技有限公司",
+      role: "软件开发实习生",
+      summary: "智能多端口设备主控固件开发。",
+      items: ["负责节点间通信、资源调度、状态管理。"],
+      linkLabel: "项目代码链接",
+      link: "https://example.com/resume-project"
+    }
+  ];
+  resume.projects = [
+    {
+      start: "2025.04",
+      end: "2025.07",
+      name: "并发内存池实验",
+      role: "后端开发",
+      summary: "基于 tcmalloc 的简化版设计与实现",
+      items: ["模拟实现核心功能。"],
+      linkLabel: "项目代码链接",
+      link: "https://example.com/project"
+    }
+  ];
+  return resume;
+}
+
+function resumeWithDeleteTargets() {
+  const resume = resumeWithContentCards();
+  resume.internships.push({
+    start: "2025.09",
+    end: "2025.12",
+    organization: "第二家公司",
+    role: "后端实习生",
+    summary: "第二段实习概述。",
+    items: ["第二段实习要点。"],
+    linkLabel: "项目代码链接",
+    link: ""
+  });
+  resume.skills = [
+    {
+      title: "C/C++编程",
+      items: ["第一条技能要点。", "第二条技能要点。"]
+    },
+    {
+      title: "操作系统/Linux 系统编程",
+      items: ["熟悉 Linux 常用工具。"]
+    }
+  ];
+  return resume;
+}
+
+test("editor server serves the local editor shell", async (t) => {
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/`);
+  const html = await response.text();
+
+  assert.equal(response.status, 200);
+  assert.match(html, /简历编辑器/);
+  assert.match(html, /id="app"/);
+  assert.match(html, /id="previewFrame"/);
+  assert.doesNotMatch(html, /id="previewImage"/);
+});
+
+test("editor server close terminates a request already being handled", async () => {
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    log: false
+  });
+  const socket = net.createConnection({ host: app.host, port: app.port });
+  await once(socket, "connect");
+  const requestStarted = once(app.server, "request");
+  socket.write([
+    "POST /api/preview HTTP/1.1",
+    `Host: ${app.host}:${app.port}`,
+    "Content-Type: application/json",
+    "Content-Length: 100000",
+    "Connection: keep-alive",
+    "",
+    "{"
+  ].join("\r\n"));
+  await requestStarted;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const closePromise = app.close();
+  const closedPromptly = await Promise.race([
+    closePromise.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 250))
+  ]);
+  socket.destroy();
+  await closePromise;
+
+  assert.equal(closedPromptly, true);
+});
+
+test("editor server serves editor and output static files", async (t) => {
+  const rootDir = makeApiFixture();
+  writeFileSync(previewHtmlPath(rootDir), "<!doctype html><html><body>preview</body></html>");
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const scriptResponse = await fetch(`${app.url}/editor/app.js`);
+  const previewResponse = await fetch(`${app.url}/output/resume.png`);
+  const htmlPreviewResponse = await fetch(`${app.url}/output/cpp/preview.html`);
+  const script = await scriptResponse.text();
+  const htmlPreview = await htmlPreviewResponse.text();
+
+  assert.equal(scriptResponse.status, 200);
+  assert.match(scriptResponse.headers.get("content-type"), /javascript/);
+  assert.match(script, /loadResume/);
+  assert.match(script, /上一版已备份/);
+  assert.equal(previewResponse.status, 200);
+  assert.match(previewResponse.headers.get("content-type"), /image\/png/);
+  assert.equal(htmlPreviewResponse.status, 200);
+  assert.match(htmlPreviewResponse.headers.get("content-type"), /text\/html/);
+  assert.match(htmlPreview, /preview/);
+});
+
+test("editor server does not serve static symlinks outside the data root", async (t) => {
+  const rootDir = makeApiFixture();
+  const outsideFile = path.join(path.dirname(rootDir), `${path.basename(rootDir)}-outside.txt`);
+  writeFileSync(outsideFile, "private-outside-data");
+  symlinkSync(outsideFile, path.join(rootDir, "output/cpp/outside.txt"));
+  symlinkSync(outsideFile, path.join(rootDir, "assets/outside.txt"));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const [outputResponse, assetResponse] = await Promise.all([
+    fetch(`${app.url}/output/cpp/outside.txt`),
+    fetch(`${app.url}/assets/outside.txt`)
+  ]);
+
+  assert.equal(outputResponse.status, 404);
+  assert.equal(assetResponse.status, 404);
+});
+
+test("editor server maps code files from project root and user files from data root", async (t) => {
+  const projectRoot = makeProjectFixture();
+  const dataRoot = makeApiFixture();
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>data-root-photo</svg>");
+  writeFileSync(previewHtmlPath(dataRoot), "<!doctype html><p>data-root-preview</p>");
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    projectRoot,
+    dataRoot,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const [index, script, template, photo, preview] = await Promise.all([
+    fetch(`${app.url}/`).then((response) => response.text()),
+    fetch(`${app.url}/editor/app.js`).then((response) => response.text()),
+    fetch(`${app.url}/templates/resume.css`).then((response) => response.text()),
+    fetch(`${app.url}/assets/photo.svg`).then((response) => response.text()),
+    fetch(`${app.url}/output/cpp/preview.html`).then((response) => response.text())
+  ]);
+
+  assert.match(index, /project-root-index/);
+  assert.match(script, /project-root-script/);
+  assert.match(template, /project-root-resume-css/);
+  assert.match(photo, /data-root-photo/);
+  assert.match(preview, /data-root-preview/);
+});
+
+test("editor resume APIs read and write only the configured data root", async (t) => {
+  const projectRoot = makeProjectFixture();
+  const dataRoot = makeApiFixture();
+  const resume = loadResumeYaml(resumeYamlPath(dataRoot));
+  resume.profile.name = "Data Root Candidate";
+  saveResumeYaml(resumeYamlPath(dataRoot), resume);
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    projectRoot,
+    dataRoot,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const getResponse = await fetch(`${app.url}/api/resume?resumeId=cpp`);
+  const getBody = await getResponse.json();
+  const updated = structuredClone(getBody.resume);
+  updated.profile.name = "Saved In Data Root";
+  const putResponse = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(updated)
+  });
+
+  assert.equal(getBody.resume.profile.name, "Data Root Candidate");
+  assert.equal(putResponse.status, 200);
+  assert.equal(loadResumeYaml(resumeYamlPath(dataRoot)).profile.name, "Saved In Data Root");
+  assert.equal(existsSync(path.join(projectRoot, "resumes.json")), false);
+  assert.equal(existsSync(path.join(projectRoot, "backups")), false);
+});
+
+test("editor generation passes both project and data roots", async (t) => {
+  const projectRoot = makeProjectFixture();
+  const dataRoot = makeApiFixture();
+  let receivedOptions;
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    projectRoot,
+    dataRoot,
+    generateResume: async (options) => {
+      receivedOptions = options;
+      return {
+        density: "normal",
+        metrics: { height: 900 },
+        outputPaths: {
+          preview: path.join(dataRoot, "output/cpp/preview.html"),
+          pdf: path.join(dataRoot, "output/cpp/resume.pdf"),
+          png: path.join(dataRoot, "output/cpp/resume.png")
+        }
+      };
+    },
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp" })
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(receivedOptions, { projectRoot, dataRoot, resumeId: "cpp" });
+});
+
+test("creating from an example materializes its allowlisted photo in the data root", async (t) => {
+  const projectRoot = makeProjectFixture();
+  const dataRoot = makeApiFixture();
+  unlinkSync(path.join(dataRoot, "assets/photo.svg"));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    projectRoot,
+    dataRoot,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/resumes/from-example`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ exampleId: "cpp", name: "Example Copy" })
+  });
+
+  assert.equal(response.status, 201);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>public-placeholder</svg>"
+  );
+});
+
+test("editor opens a draft directly when the generated preview is absent", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const generatedPreviewRequests = [];
+  const consoleErrors = [];
+  page.on("response", (response) => {
+    if (response.url().includes("/output/cpp/preview.html")) {
+      generatedPreviewRequests.push(response.status());
+    }
+  });
+  page.on("console", (message) => {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await waitForPreviewInteractive(page);
+
+  assert.deepEqual(generatedPreviewRequests, []);
+  assert.deepEqual(consoleErrors, []);
+  assert.match(await page.textContent("#statusStrip"), /PDF 待生成/);
+  assert.match(await page.getAttribute("#previewFrame", "srcdoc"), /测试候选人/);
+});
+
+test("editor switches modules when a preview section is clicked", async (t) => {
+  const rootDir = makeApiFixture();
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-module='profile']");
+  await waitForPreviewInteractive(page);
+  await page.frameLocator("#previewFrame").locator("section[data-section='skills']").click();
+  await page.waitForFunction(() => document
+    .querySelector("[data-module='skills']")
+    ?.getAttribute("aria-selected") === "true");
+
+  assert.equal(await page.getAttribute("[data-area='content']", "aria-selected"), "true");
+  assert.equal(await page.getAttribute("[data-module='skills']", "aria-selected"), "true");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：专业技能/);
+});
+
+test("editor opens a profile field when the matching preview field is selected", async (t) => {
+  const rootDir = makeApiFixture();
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await sendPreviewSelection(page, "profile", "profile.name");
+  await page.waitForSelector("[data-path='profile.name'].is-form-selected");
+
+  assert.equal(await page.getAttribute("[data-area='content']", "aria-selected"), "true");
+  assert.equal(await page.getAttribute("[data-module='profile']", "aria-selected"), "true");
+  assert.equal(await page.locator("[data-path='profile.name']").inputValue(), "测试候选人");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：姓名/);
+});
+
+test("editor scrolls to a content card when the matching preview card is clicked", async (t) => {
+  const rootDir = makeApiFixture();
+  const resume = resumeWithContentCards();
+  saveResumeYaml(resumeYamlPath(rootDir), resume);
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(resume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-module='profile']");
+
+  await sendPreviewSelection(page, "internships", "internships.0");
+  await page.waitForSelector(".item-block.is-form-selected[data-path='internships.0']");
+  assert.equal(await page.getAttribute("[data-module='internships']", "aria-selected"), "true");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：实习经历 1/);
+
+  await sendPreviewSelection(page, "skills", "skills.0");
+  await page.waitForSelector(".item-block.is-form-selected[data-path='skills.0']");
+  assert.equal(await page.getAttribute("[data-module='skills']", "aria-selected"), "true");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：专业技能 1/);
+
+  await sendPreviewSelection(page, "projects", "projects.0");
+  await page.waitForSelector(".item-block.is-form-selected[data-path='projects.0']");
+  assert.equal(await page.getAttribute("[data-module='projects']", "aria-selected"), "true");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：项目经历 1/);
+});
+
+test("editor opens nested form controls when matching preview fields are clicked", async (t) => {
+  const rootDir = makeApiFixture();
+  const resume = resumeWithContentCards();
+  saveResumeYaml(resumeYamlPath(rootDir), resume);
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(resume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await waitForPreviewInteractive(page);
+
+  const frame = page.frameLocator("#previewFrame");
+  assert.equal(await frame.locator("[data-path='internships.0.organization']").count(), 1);
+  assert.equal(await frame.locator("[data-path='skills.0.items.0']").count(), 1);
+  assert.equal(await frame.locator("[data-path='projects.0.items.0']").count(), 1);
+
+  await sendPreviewSelection(page, "internships", "internships.0.organization");
+  await page.waitForFunction(() => document.querySelector("[data-module='internships']")?.getAttribute("aria-selected") === "true");
+  assert.equal(await page.getAttribute("[data-module='internships']", "aria-selected"), "true");
+  assert.equal(await page.locator("[data-path='internships.0.organization']").inputValue(), "示例科技有限公司");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：实习经历 1 公司/);
+
+  await sendPreviewSelection(page, "skills", "skills.0.items.0");
+  await page.waitForFunction(() => document.querySelector("[data-module='skills']")?.getAttribute("aria-selected") === "true");
+  assert.equal(await page.getAttribute("[data-module='skills']", "aria-selected"), "true");
+  assert.equal(await page.locator("[data-path='skills.0.items.0']").inputValue(), "熟悉 C/C++ 基本语法。");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：专业技能 1 要点 1/);
+
+  await sendPreviewSelection(page, "projects", "projects.0.items.0");
+  await page.waitForFunction(() => document.querySelector("[data-module='projects']")?.getAttribute("aria-selected") === "true");
+  assert.equal(await page.getAttribute("[data-module='projects']", "aria-selected"), "true");
+  assert.equal(await page.locator("[data-path='projects.0.items.0']").inputValue(), "模拟实现核心功能。");
+  assert.match(await page.textContent("#messageLine"), /正在编辑：项目经历 1 要点 1/);
+});
+
+test("editor adds experiences skills and bullets in the expected location", async (t) => {
+  const rootDir = makeApiFixture();
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+
+  await page.click("[data-module='internships']");
+  await page.click("[data-action='add-experience'][data-key='internships']");
+  await page.waitForSelector("[data-path='internships.0.start']");
+  assert.equal(await page.locator("[data-path='internships.0.start']").count(), 1);
+  assert.match(await page.textContent("#statusStrip"), /未保存/);
+
+  await page.click("[data-module='projects']");
+  await page.click("[data-action='add-experience'][data-key='projects']");
+  await page.waitForSelector("[data-path='projects.0.start']");
+  assert.equal(await page.locator("[data-path='projects.0.start']").count(), 1);
+
+  await page.click("[data-module='skills']");
+  await page.click("[data-action='add-skill']");
+  await page.waitForSelector("[data-path='skills.1.title']");
+  assert.equal(await page.locator("[data-path='skills.1.title']").count(), 1);
+
+  await page.click("[data-action='add-bullet'][data-key='skills'][data-index='0']");
+  await page.waitForSelector("[data-path='skills.0.items.1']");
+  assert.equal(await page.locator("[data-path='skills.0.items.1']").count(), 1);
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return Boolean(iframe?.contentDocument?.querySelector("[data-path='skills.0.items.1']"))
+      && status.includes("草稿预览");
+  });
+});
+
+test("editor confirms deletion inline and focuses adjacent content", async (t) => {
+  const rootDir = makeApiFixture();
+  const resume = resumeWithDeleteTargets();
+  saveResumeYaml(resumeYamlPath(rootDir), resume);
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(resume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  let dialogCount = 0;
+  page.on("dialog", async (dialog) => {
+    dialogCount += 1;
+    await dialog.dismiss();
+  });
+
+  await page.goto(app.url);
+  await page.click("[data-module='skills']");
+
+  await page.click("[data-action='delete-bullet'][data-key='skills'][data-index='0'][data-item-index='0']");
+  await page.waitForSelector(".delete-confirm-panel [data-action='confirm-delete'][data-kind='bullet'][data-key='skills'][data-index='0'][data-item-index='0']");
+  assert.equal(dialogCount, 0);
+  assert.equal(await page.locator("[data-path^='skills.0.items.']").count(), 2);
+  assert.equal(await page.locator(".row-actions-bullet.is-confirming-delete").count(), 0);
+
+  await page.click("[data-action='cancel-delete'][data-kind='bullet'][data-key='skills'][data-index='0'][data-item-index='0']");
+  await page.waitForSelector("[data-action='delete-bullet'][data-key='skills'][data-index='0'][data-item-index='0']");
+  assert.equal(await page.locator(".delete-confirm-panel").count(), 0);
+  assert.equal(await page.locator("[data-path^='skills.0.items.']").count(), 2);
+
+  await page.click("[data-action='delete-bullet'][data-key='skills'][data-index='0'][data-item-index='0']");
+  await page.click(".delete-confirm-panel [data-action='confirm-delete'][data-kind='bullet'][data-key='skills'][data-index='0'][data-item-index='0']");
+  await page.waitForFunction(() => document.activeElement?.dataset?.path === "skills.0.items.0");
+  assert.equal(await page.locator("[data-path^='skills.0.items.']").count(), 1);
+  assert.equal(await page.locator("[data-path='skills.0.items.0']").inputValue(), "第二条技能要点。");
+
+  await page.click("[data-action='delete-skill'][data-key='skills'][data-index='0']");
+  await page.waitForSelector(".item-block[data-path='skills.0'] .delete-confirm-panel");
+  await page.click(".delete-confirm-panel [data-action='confirm-delete'][data-kind='skill'][data-key='skills'][data-index='0']");
+  await page.waitForFunction(() => document.activeElement?.dataset?.path === "skills.0.title");
+  assert.equal(await page.locator(".item-block").count(), 1);
+  assert.equal(await page.locator("[data-path='skills.0.title']").inputValue(), "操作系统/Linux 系统编程");
+
+  await page.click("[data-module='internships']");
+  await page.click("[data-action='delete-experience'][data-key='internships'][data-index='0']");
+  await page.waitForSelector(".item-block[data-path='internships.0'] .delete-confirm-panel");
+  await page.click(".delete-confirm-panel [data-action='confirm-delete'][data-kind='experience'][data-key='internships'][data-index='0']");
+  await page.waitForFunction(() => document.activeElement?.dataset?.path === "internships.0.start");
+  assert.equal(await page.locator(".item-block").count(), 1);
+  assert.equal(await page.locator("[data-path='internships.0.start']").inputValue(), "2025.09");
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    const remainingCompany = iframe?.contentDocument?.querySelector("[data-path='internships.0.organization']")?.textContent || "";
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return remainingCompany.includes("第二家公司") && status.includes("草稿预览");
+  });
+});
+
+test("editor protects edits, saves with keyboard shortcuts, and generates the latest preview", async (t) => {
+  const rootDir = makeApiFixture();
+  const previewPath = previewHtmlPath(rootDir);
+  writeFileSync(previewPath, renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    generateResume: async () => {
+      const savedResume = loadResumeYaml(resumeYamlPath(rootDir));
+      writeFileSync(previewPath, renderResumeHtml(savedResume, {
+        density: "tight",
+        cssPath: "/templates/resume.css"
+      }));
+      return {
+        density: "tight",
+        metrics: { height: 1000 },
+        outputPaths: {
+          preview: previewPath,
+          pdf: path.join(rootDir, "output/resume.pdf"),
+          png: path.join(rootDir, "output/resume.png")
+        }
+      };
+    },
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  let saveRequestCount = 0;
+  page.on("request", (request) => {
+    if (request.method() === "PUT" && request.url().includes("/api/resume?")) {
+      saveRequestCount += 1;
+    }
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await waitForPreviewInteractive(page);
+  await page.evaluate(() => {
+    window.__resumeSaveShortcuts = [];
+    document.addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+        window.__resumeSaveShortcuts.push(event.defaultPrevented);
+      }
+    });
+  });
+  assert.match(await page.textContent("#statusStrip"), /预览已更新/);
+  assert.equal(await page.textContent("#generateButton"), "重新生成预览");
+  assert.deepEqual(await dispatchBeforeUnload(page), {
+    defaultPrevented: false,
+    dispatchResult: true
+  });
+
+  await page.fill("[data-path='profile.name']", "测试姓名");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("草稿预览"));
+  assert.match(await page.textContent("#statusStrip"), /未保存/);
+  assert.equal(await page.textContent("#generateButton"), "保存后生成");
+  assert.equal(await page.locator("#generateButton").isDisabled(), true);
+  assert.deepEqual(await dispatchBeforeUnload(page), {
+    defaultPrevented: true,
+    dispatchResult: false
+  });
+
+  await dispatchPreviewClick(page, "[data-path='profile.name']");
+  await page.waitForFunction(() => document.querySelector("#messageLine")?.textContent?.includes("未保存草稿"));
+
+  const metaSaveResponse = page.waitForResponse((response) => response.request().method() === "PUT"
+    && response.url().includes("/api/resume?"));
+  await page.keyboard.press("Meta+S");
+  await metaSaveResponse;
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("PDF 待生成"));
+  assert.match(await page.textContent("#statusStrip"), /已保存/);
+  assert.equal(await page.textContent("#generateButton"), "生成 PDF");
+  assert.equal(await page.locator("#generateButton").isDisabled(), false);
+  assert.match(await page.getAttribute("#previewFrame", "srcdoc"), /测试姓名/);
+  assert.deepEqual(await dispatchBeforeUnload(page), {
+    defaultPrevented: false,
+    dispatchResult: true
+  });
+
+  await page.fill("[data-path='profile.name']", "Ctrl 保存测试");
+  const ctrlSaveResponse = page.waitForResponse((response) => response.request().method() === "PUT"
+    && response.url().includes("/api/resume?"));
+  await page.keyboard.press("Control+S");
+  await ctrlSaveResponse;
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("PDF 待生成")
+    && document.querySelector("#statusStrip")?.textContent?.includes("已保存"));
+  assert.equal(saveRequestCount, 2);
+  assert.equal(loadResumeYaml(resumeYamlPath(rootDir)).profile.name, "Ctrl 保存测试");
+  assert.deepEqual(await page.evaluate(() => window.__resumeSaveShortcuts), [true, true]);
+
+  await page.click("#generateButton");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("预览已更新"));
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    return !iframe?.hasAttribute("srcdoc")
+      && iframe?.contentDocument?.querySelector("[data-path='profile.name']")?.textContent?.includes("Ctrl 保存测试");
+  });
+  assert.equal(await page.textContent("#generateButton"), "重新生成预览");
+  assert.match(await page.textContent("#messageLine"), /预览已更新/);
+});
+
+test("editor renders unsaved edits in a debounced draft preview without writing files", async (t) => {
+  const rootDir = makeApiFixture();
+  const previewPath = previewHtmlPath(rootDir);
+  const generatedPreview = renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  });
+  writeFileSync(previewPath, generatedPreview);
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await waitForPreviewInteractive(page);
+
+  await page.fill("[data-path='profile.name']", "实时草稿姓名");
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    const previewName = iframe?.contentDocument?.querySelector("[data-path='profile.name']")?.textContent || "";
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return previewName.includes("实时草稿姓名") && status.includes("草稿预览");
+  }, null, { timeout: 2000 });
+
+  assert.match(await page.textContent("#statusStrip"), /未保存/);
+  assert.equal(await page.textContent("#generateButton"), "保存后生成");
+  assert.equal(loadResumeYaml(resumeYamlPath(rootDir)).profile.name, "测试候选人");
+  assert.equal(readFileSync(previewPath, "utf8"), generatedPreview);
+});
+
+test("editor ignores a slower draft response after a newer edit", async (t) => {
+  const previewRequests = [];
+  const app = await startCustomEditorServer(async (request, response, url) => {
+    if (request.method === "GET" && url.pathname === "/api/resume") {
+      sendTestJson(response, 200, { ok: true, resume: validResume });
+      return true;
+    }
+    if (request.method === "GET" && url.pathname === "/api/examples") {
+      sendTestJson(response, 200, { ok: true, examples: [] });
+      return true;
+    }
+    if (request.method === "GET" && url.pathname === "/api/backups") {
+      sendTestJson(response, 200, { ok: true, backups: [] });
+      return true;
+    }
+    if (request.method === "POST" && url.pathname === "/api/preview") {
+      const body = await readTestJsonBody(request);
+      const name = body.resume.profile.name;
+      previewRequests.push(name);
+      if (name === "较慢的第一版") {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+      sendTestJson(response, 200, {
+        ok: true,
+        html: renderResumeHtml(body.resume, {
+          density: "normal",
+          cssPath: "/templates/resume.css",
+          assetPrefix: "/"
+        })
+      });
+      return true;
+    }
+    return false;
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "较慢的第一版");
+  await page.waitForTimeout(350);
+  await page.fill("[data-path='profile.name']", "最终的第二版");
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    return iframe?.contentDocument?.querySelector("[data-path='profile.name']")?.textContent?.includes("最终的第二版");
+  });
+  await page.waitForTimeout(600);
+
+  const previewName = await page.frameLocator("#previewFrame").locator("[data-path='profile.name']").textContent();
+  assert.match(previewName, /最终的第二版/);
+  assert.deepEqual(previewRequests, ["较慢的第一版", "最终的第二版"]);
+});
+
+test("editor previews section reordering without saving yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const resume = structuredClone(validResume);
+  resume.layout = { sectionOrder: ["internships", "skills", "projects"] };
+  const resumePath = resumeYamlPath(rootDir);
+  saveResumeYaml(resumePath, resume);
+  const resumeBefore = readFileSync(resumePath, "utf8");
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(resume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-area='layout']");
+  await page.click("[data-area='layout']");
+  await page.click("[data-action='move-layout'][data-index='0'][data-direction='1']");
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    const sections = Array.from(iframe?.contentDocument?.querySelectorAll("#resume-page > section") || []);
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return sections[0]?.dataset.section === "skills"
+      && sections[1]?.dataset.section === "internships"
+      && status.includes("草稿预览");
+  });
+
+  assert.match(await page.textContent("#statusStrip"), /草稿预览/);
+  assert.equal(readFileSync(resumePath, "utf8"), resumeBefore);
+});
+
+test("editor explains backend version mismatch when an API endpoint is missing", async (t) => {
+  const app = await startCustomEditorServer(async (_request, response, url) => {
+    if (url.pathname === "/api/resume") {
+      sendTestJson(response, 200, { ok: true, resume: validResume });
+      return true;
+    }
+
+    if (url.pathname === "/api/examples") {
+      sendTestJson(response, 200, { ok: true, examples: [] });
+      return true;
+    }
+
+    if (url.pathname === "/api/backups") {
+      sendTestText(response, 404, "Not found");
+      return true;
+    }
+
+    return false;
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  const backupsResponse = page.waitForResponse((response) => response.url().includes("/api/backups?"));
+  await page.goto(app.url);
+  await backupsResponse;
+  await page.waitForFunction(() => {
+    const text = document.querySelector("#messageLine")?.textContent || "";
+    return text.includes("重新运行 npm run editor") || text.includes("前端和后端版本不一致");
+  });
+
+  assert.match(await page.textContent("#messageLine"), /前端和后端版本不一致/);
+});
+
+test("editor disables save controls while a save request is in flight", async (t) => {
+  let releaseSave;
+  let saveCount = 0;
+  const saveBlocked = new Promise((resolve) => {
+    releaseSave = resolve;
+  });
+  const app = await startCustomEditorServer(async (request, response, url) => {
+    if (request.method === "GET" && url.pathname === "/api/resume") {
+      sendTestJson(response, 200, { ok: true, resume: validResume });
+      return true;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/examples") {
+      sendTestJson(response, 200, { ok: true, examples: [] });
+      return true;
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/backups") {
+      sendTestJson(response, 200, { ok: true, backups: [] });
+      return true;
+    }
+
+    if (request.method === "PUT" && url.pathname === "/api/resume") {
+      saveCount += 1;
+      await saveBlocked;
+      sendTestJson(response, 200, {
+        ok: true,
+        resume: validResume,
+        backup: "backups/cpp/resume.backup.yaml",
+        versionedBackup: "backups/cpp/resume-20260710-142530.yaml"
+      });
+      return true;
+    }
+
+    return false;
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "测试姓名");
+  await page.click("#saveButton");
+  await page.waitForFunction(() => document.querySelector("#saveButton")?.textContent === "保存中");
+
+  assert.equal(await page.locator("#saveButton").isDisabled(), true);
+  assert.equal(await page.locator("#generateButton").isDisabled(), true);
+  assert.equal(await page.locator("#loadExampleButton").isDisabled(), true);
+  assert.equal(saveCount, 1);
+
+  releaseSave();
+  await page.waitForFunction(() => document.querySelector("#saveButton")?.textContent === "保存");
+  assert.equal(saveCount, 1);
+  assert.match(await page.textContent("#messageLine"), /已保存/);
+});
+
+test("editor lists recent backups and restores the selected backup after confirmation", async (t) => {
+  const rootDir = makeApiFixture();
+  const backupResume = structuredClone(validResume);
+  backupResume.profile.name = "备份姓名";
+  const currentResume = structuredClone(validResume);
+  currentResume.profile.name = "当前姓名";
+  mkdirSync(path.join(rootDir, "backups/cpp"), { recursive: true });
+  saveResumeYaml(resumeYamlPath(rootDir), currentResume);
+  saveResumeYaml(path.join(rootDir, "backups/cpp/resume-20260710-142530.yaml"), backupResume);
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(currentResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.addInitScript(() => {
+    window.__confirmMessages = [];
+    window.confirm = (message) => {
+      window.__confirmMessages.push(message);
+      return true;
+    };
+  });
+
+  await page.goto(app.url);
+  await page.waitForFunction(() => Array
+    .from(document.querySelectorAll("#backupSelect option"))
+    .some((option) => option.value === "backups/cpp/resume-20260710-142530.yaml"));
+  await page.fill("[data-path='profile.name']", "恢复前的未保存草稿");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("草稿预览"));
+  assert.match(await page.getAttribute("#previewFrame", "srcdoc"), /恢复前的未保存草稿/);
+  await page.selectOption("#backupSelect", "backups/cpp/resume-20260710-142530.yaml");
+  await page.click("#restoreBackupButton");
+  await page.waitForFunction(() => document.querySelector("#messageLine")?.textContent?.includes("已恢复备份"));
+  await page.waitForSelector("[data-path='profile.name']");
+
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+  const confirmMessages = await page.evaluate(() => window.__confirmMessages);
+  assert.equal(confirmMessages.length, 1);
+  assert.match(confirmMessages[0], /确认恢复备份/);
+  assert.equal(reloaded.profile.name, "备份姓名");
+  assert.equal(await page.locator("[data-path='profile.name']").inputValue(), "备份姓名");
+  assert.match(await page.textContent("#statusStrip"), /待生成/);
+  assert.equal(await page.getAttribute("#previewFrame", "srcdoc"), null);
+});
+
+test("editor scales the HTML preview so the A4 page is not horizontally clipped", async (t) => {
+  const rootDir = makeApiFixture();
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t, { viewport: { width: 1280, height: 900 } });
+  await page.goto(app.url);
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    const resume = iframe?.contentDocument?.querySelector("#resume-page");
+    return Boolean(resume);
+  });
+
+  const metrics = await page.locator("#previewFrame").evaluate((iframe) => {
+    const documentInFrame = iframe.contentDocument;
+    const resume = documentInFrame.querySelector("#resume-page");
+    return {
+      iframeViewportWidth: iframe.contentWindow.innerWidth,
+      resumeWidth: Math.ceil(resume.getBoundingClientRect().width)
+    };
+  });
+
+  assert.ok(metrics.iframeViewportWidth >= metrics.resumeWidth);
+});
+
+test("editor keeps the complete A4 preview and footer inside the viewport", async (t) => {
+  const rootDir = makeApiFixture();
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t, { viewport: { width: 1440, height: 900 } });
+  await page.goto(app.url);
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    return Boolean(iframe?.contentDocument?.querySelector("#resume-page"));
+  });
+
+  const metrics = await page.evaluate(() => {
+    const stage = document.querySelector(".preview-stage").getBoundingClientRect();
+    const frame = document.querySelector(".a4-frame").getBoundingClientRect();
+    const actionBar = document.querySelector(".action-bar").getBoundingClientRect();
+    const message = document.querySelector(".message-line").getBoundingClientRect();
+    return {
+      viewportHeight: window.innerHeight,
+      documentHeight: document.documentElement.scrollHeight,
+      stage: { top: stage.top, bottom: stage.bottom },
+      frame: { top: frame.top, bottom: frame.bottom },
+      actionBar: { top: actionBar.top, bottom: actionBar.bottom },
+      message: { top: message.top, bottom: message.bottom }
+    };
+  });
+
+  assert.ok(metrics.documentHeight <= metrics.viewportHeight);
+  assert.ok(metrics.frame.top >= metrics.stage.top);
+  assert.ok(metrics.frame.bottom <= metrics.stage.bottom);
+  assert.ok(metrics.actionBar.bottom <= metrics.viewportHeight);
+  assert.ok(metrics.message.bottom <= metrics.viewportHeight);
+});
+
+test("editor asks to regenerate a preview created without field paths", async (t) => {
+  const rootDir = makeApiFixture();
+  const stalePreview = renderResumeHtml(validResume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }).replace(/\sdata-path="[^"]*"/g, "");
+  writeFileSync(previewHtmlPath(rootDir), stalePreview);
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await waitForPreviewInteractive(page);
+  await page.waitForFunction(() => {
+    const message = document.querySelector("#messageLine")?.textContent || "";
+    return message.includes("旧版本生成") && message.includes("重新生成");
+  }, null, { timeout: 1000 });
+
+  assert.match(await page.textContent("#statusStrip"), /待生成/);
+  assert.equal(await page.textContent("#generateButton"), "生成 PDF");
+});
+
+test("editor keeps footer utilities stacked beside the generate action", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t, { viewport: { width: 1024, height: 900 } });
+  await page.goto(app.url);
+  await page.waitForSelector("#generateButton");
+
+  assert.equal(await page.locator(".example-actions").count(), 1);
+
+  const metrics = await page.evaluate(() => {
+    const actionBar = document.querySelector(".action-bar");
+    const example = document.querySelector(".example-actions");
+    const backup = document.querySelector(".backup-actions");
+    const generate = document.querySelector("#generateButton");
+    const box = (element) => element.getBoundingClientRect();
+    return {
+      display: window.getComputedStyle(actionBar).display,
+      example: box(example),
+      backup: box(backup),
+      generate: box(generate)
+    };
+  });
+
+  assert.equal(metrics.display, "grid");
+  assert.ok(metrics.example.bottom <= metrics.backup.top);
+  assert.ok(metrics.example.right < metrics.generate.left);
+  assert.ok(metrics.backup.right < metrics.generate.left);
+  assert.ok(metrics.generate.top < metrics.backup.top);
+  assert.ok(metrics.generate.bottom > metrics.example.bottom);
+});
+
+test("preview field hover and selection do not paint ancestor sections", async (t) => {
+  const rootDir = makeApiFixture();
+  const resume = resumeWithContentCards();
+  saveResumeYaml(resumeYamlPath(rootDir), resume);
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(resume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await waitForPreviewInteractive(page);
+  const frame = page.frameLocator("#previewFrame");
+  const skillSection = frame.locator("section[data-section='skills']");
+  const skillGroup = frame.locator("[data-path='skills.0']");
+  const skillBullet = frame.locator("[data-path='skills.0.items.0']");
+  const bulletBox = await skillBullet.boundingBox();
+  assert.ok(bulletBox);
+  await page.mouse.move(bulletBox.x + bulletBox.width / 2, bulletBox.y + bulletBox.height / 2);
+  await page.waitForTimeout(50);
+
+  const hoverStyles = {
+    sectionBackground: await skillSection.evaluate((section) => window.getComputedStyle(section).backgroundColor),
+    groupBackground: await skillGroup.evaluate((group) => window.getComputedStyle(group).backgroundColor),
+    bulletBackground: await skillBullet.evaluate((bullet) => window.getComputedStyle(bullet).backgroundColor)
+  };
+  assert.equal(hoverStyles.sectionBackground, "rgba(0, 0, 0, 0)");
+  assert.equal(hoverStyles.groupBackground, "rgba(0, 0, 0, 0)");
+  assert.notEqual(hoverStyles.bulletBackground, "rgba(0, 0, 0, 0)");
+
+  await dispatchPreviewClick(page, "[data-path='skills.0.items.0']");
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    return iframe
+      ?.contentDocument
+      ?.querySelector("[data-path='skills.0.items.0']")
+      ?.classList
+      .contains("is-preview-selected");
+  });
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    const section = iframe?.contentDocument?.querySelector("section[data-section='skills']");
+    const group = iframe?.contentDocument?.querySelector("[data-path='skills.0']");
+    const bullet = iframe?.contentDocument?.querySelector("[data-path='skills.0.items.0']");
+    if (!section || !group || !bullet) {
+      return false;
+    }
+    const sectionStyle = iframe.contentWindow.getComputedStyle(section);
+    const groupStyle = iframe.contentWindow.getComputedStyle(group);
+    const bulletStyle = iframe.contentWindow.getComputedStyle(bullet);
+    return bulletStyle.outlineStyle === "none"
+      && bulletStyle.backgroundColor !== "rgba(0, 0, 0, 0)"
+      && bulletStyle.boxShadow === "none"
+      && sectionStyle.backgroundColor === "rgba(0, 0, 0, 0)"
+      && groupStyle.backgroundColor === "rgba(0, 0, 0, 0)";
+  });
+
+  const fieldStyles = await skillBullet.evaluate((bullet) => {
+    const computed = window.getComputedStyle(bullet);
+    return {
+      outlineStyle: computed.outlineStyle,
+      backgroundColor: computed.backgroundColor,
+      boxShadow: computed.boxShadow
+    };
+  });
+  const sectionBackground = await skillSection.evaluate((section) => window.getComputedStyle(section).backgroundColor);
+  const groupBackground = await skillGroup.evaluate((group) => window.getComputedStyle(group).backgroundColor);
+
+  await frame.locator("[data-path='internships.0.items.0']").hover();
+  const experienceBackground = await frame
+    .locator("[data-path='internships.0']")
+    .evaluate((experience) => window.getComputedStyle(experience).backgroundColor);
+
+  assert.equal(fieldStyles.outlineStyle, "none");
+  assert.equal(fieldStyles.boxShadow, "none");
+  assert.notEqual(fieldStyles.backgroundColor, "rgba(0, 0, 0, 0)");
+  assert.equal(sectionBackground, "rgba(0, 0, 0, 0)");
+  assert.equal(groupBackground, "rgba(0, 0, 0, 0)");
+  assert.equal(experienceBackground, "rgba(0, 0, 0, 0)");
+});
+
+test("editor server falls back when the preferred port is occupied", async (t) => {
+  const blocker = await startPortBlocker();
+  t.after(() => blocker.close());
+  const occupiedPort = blocker.address().port;
+  const app = await startEditorServer({
+    preferredPort: occupiedPort,
+    maxPort: occupiedPort + 1,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  assert.equal(app.port, occupiedPort + 1);
+  assert.equal(app.url, `http://127.0.0.1:${occupiedPort + 1}`);
+});
+
+test("GET /api/resume returns the current resume yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/resume?resumeId=cpp`);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.resume.profile.name, "测试候选人");
+  assert.equal(body.generatedPreviewAvailable, false);
+
+  writeFileSync(previewHtmlPath(rootDir), "<!doctype html><p>generated</p>");
+  const generatedResponse = await fetch(`${app.url}/api/resume?resumeId=cpp`);
+  const generatedBody = await generatedResponse.json();
+  assert.equal(generatedBody.generatedPreviewAvailable, true);
+});
+
+test("POST /api/preview renders draft HTML without writing project files", async (t) => {
+  const rootDir = makeApiFixture();
+  const resumePath = resumeYamlPath(rootDir);
+  const previewPath = previewHtmlPath(rootDir);
+  writeFileSync(previewPath, "existing generated preview");
+  const resumeBefore = readFileSync(resumePath, "utf8");
+  const previewBefore = readFileSync(previewPath, "utf8");
+  const draft = structuredClone(validResume);
+  draft.profile.name = "实时草稿姓名";
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", resume: draft })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.match(body.html, /实时草稿姓名/);
+  assert.match(body.html, /data-path="profile\.name"/);
+  assert.match(body.html, /href="\/templates\/resume\.css"/);
+  assert.match(body.html, /src="\/assets\/photo\.svg"/);
+  assert.equal(readFileSync(resumePath, "utf8"), resumeBefore);
+  assert.equal(readFileSync(previewPath, "utf8"), previewBefore);
+  assert.equal(existsSync(path.join(rootDir, "backups/cpp/resume.backup.yaml")), false);
+  assert.equal(existsSync(path.join(rootDir, "backups")), false);
+});
+
+test("PUT /api/resume validates and saves resume yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+  const updated = structuredClone(validResume);
+  updated.profile.name = "测试姓名";
+
+  const response = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(updated)
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(reloaded.profile.name, "测试姓名");
+});
+
+test("PUT /api/resume backs up the previous resume yaml before saving", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+  const updated = structuredClone(validResume);
+  updated.profile.name = "覆盖后的姓名";
+
+  const response = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(updated)
+  });
+  const body = await response.json();
+  const backup = loadResumeYaml(path.join(rootDir, "backups/cpp/resume.backup.yaml"));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.backup, "backups/cpp/resume.backup.yaml");
+  assert.equal(backup.profile.name, "测试候选人");
+});
+
+test("PUT /api/resume writes a timestamped backup entry", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+  const updated = structuredClone(validResume);
+  updated.profile.name = "覆盖后的姓名";
+
+  const response = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(updated)
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.match(body.versionedBackup, /^backups\/cpp\/resume-\d{8}-\d{6}(?:-\d+)?\.yaml$/);
+  assert.ok(existsSync(path.join(rootDir, body.versionedBackup)));
+  assert.equal(loadResumeYaml(path.join(rootDir, body.versionedBackup)).profile.name, "测试候选人");
+});
+
+test("PUT /api/resume rejects invalid data without overwriting yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+  const invalid = structuredClone(validResume);
+  delete invalid.profile.email;
+
+  const response = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(invalid)
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 400);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /profile.email is required/);
+  assert.equal(reloaded.profile.name, "测试候选人");
+});
+
+test("PUT /api/resume rejects oversized JSON bodies", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    bodyLimitBytes: 32,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ padding: "x".repeat(128) })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 413);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /File too large/);
+});
+
+test("POST /api/generate returns generation metadata and output URLs", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    generateResume: async () => ({
+      density: "tight",
+      metrics: { height: 1074 },
+      outputPaths: {
+        preview: previewHtmlPath(rootDir),
+        pdf: path.join(rootDir, "output/resume.pdf"),
+        png: path.join(rootDir, "output/resume.png")
+      }
+    }),
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp" })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.density, "tight");
+  assert.equal(body.contentHeight, 1074);
+  assert.equal(body.outputs.pdf, "/output/cpp/resume.pdf");
+  assert.equal(body.outputs.png, "/output/cpp/resume.png");
+  assert.equal(body.outputs.html, "/output/cpp/preview.html");
+});
+
+test("GET /api/backups returns recent timestamped backups", async (t) => {
+  const rootDir = makeApiFixture();
+  mkdirSync(path.join(rootDir, "backups/cpp"), { recursive: true });
+  saveResumeYaml(path.join(rootDir, "backups/cpp/resume-20260710-142530.yaml"), validResume);
+  saveResumeYaml(path.join(rootDir, "backups/cpp/resume-20260710-142531.yaml"), validResume);
+  writeFileSync(path.join(rootDir, "backups/cpp/not-a-resume.yaml"), "profile: invalid\n");
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/backups?resumeId=cpp`);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.deepEqual(body.backups.map((backup) => backup.file), [
+    "backups/cpp/resume-20260710-142531.yaml",
+    "backups/cpp/resume-20260710-142530.yaml"
+  ]);
+  assert.match(body.backups[0].label, /2026-07-10 14:25:31/);
+});
+
+test("POST /api/restore-backup restores an allowlisted backup and backs up current yaml first", async (t) => {
+  const rootDir = makeApiFixture();
+  const backupResume = structuredClone(validResume);
+  backupResume.profile.name = "备份姓名";
+  const currentResume = structuredClone(validResume);
+  currentResume.profile.name = "当前姓名";
+  mkdirSync(path.join(rootDir, "backups/cpp"), { recursive: true });
+  saveResumeYaml(resumeYamlPath(rootDir), currentResume);
+  saveResumeYaml(path.join(rootDir, "backups/cpp/resume-20260710-142530.yaml"), backupResume);
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/restore-backup`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", file: "backups/cpp/resume-20260710-142530.yaml" })
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.restoredBackup, "backups/cpp/resume-20260710-142530.yaml");
+  assert.equal(reloaded.profile.name, "备份姓名");
+  assert.equal(loadResumeYaml(path.join(rootDir, "backups/cpp/resume.backup.yaml")).profile.name, "当前姓名");
+  assert.match(body.versionedBackup, /^backups\/cpp\/resume-\d{8}-\d{6}(?:-\d+)?\.yaml$/);
+  assert.equal(loadResumeYaml(path.join(rootDir, body.versionedBackup)).profile.name, "当前姓名");
+});
+
+test("POST /api/restore-backup rejects path traversal without overwriting yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const currentResume = structuredClone(validResume);
+  currentResume.profile.name = "当前姓名";
+  saveResumeYaml(resumeYamlPath(rootDir), currentResume);
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/restore-backup`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", file: "../resume.yaml" })
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 400);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /Unknown backup/);
+  assert.equal(reloaded.profile.name, "当前姓名");
+});
+
+test("GET /api/examples returns allowlisted examples", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/examples`);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.deepEqual(body.examples.map((example) => example.id), ["cpp", "ai-agent"]);
+});
+
+test("POST /api/load-example loads an allowlisted example into resume yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/load-example`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", id: "ai-agent" })
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(reloaded.profile.target, "AI Agent 应用开发工程师");
+});
+
+test("POST /api/load-example backs up the previous resume yaml before overwriting", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/load-example`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", id: "ai-agent" })
+  });
+  const body = await response.json();
+  const backup = loadResumeYaml(path.join(rootDir, "backups/cpp/resume.backup.yaml"));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.backup, "backups/cpp/resume.backup.yaml");
+  assert.equal(backup.profile.target, "C++开发工程师");
+});
+
+test("POST /api/load-example rejects unknown example ids", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/load-example`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", id: "../resume" })
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 400);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /Unknown example/);
+  assert.equal(reloaded.profile.name, "测试候选人");
+});
+
+test("POST /api/photo writes a supported image and updates resume yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/photo`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      resumeId: "cpp",
+      filename: "portrait.png",
+      dataUrl: `data:image/png;base64,${Buffer.from("png-bytes").toString("base64")}`
+    })
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(reloaded.profile.photo, "assets/cpp-photo.png");
+  assert.equal(body.resume.profile.photo, "assets/cpp-photo.png");
+});
+
+test("POST /api/photo rejects an asset symlink before writing outside the data root", async (t) => {
+  const rootDir = makeApiFixture();
+  const resume = loadResumeYaml(resumeYamlPath(rootDir));
+  resume.profile.photo = "photos/photo.svg";
+  mkdirSync(path.join(rootDir, "photos"));
+  writeFileSync(path.join(rootDir, "photos/photo.svg"), "<svg></svg>");
+  saveResumeYaml(resumeYamlPath(rootDir), resume);
+  rmSync(path.join(rootDir, "assets"), { recursive: true });
+  const outsideAssets = `${rootDir}-outside-assets`;
+  mkdirSync(outsideAssets);
+  symlinkSync(outsideAssets, path.join(rootDir, "assets"));
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/photo`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      resumeId: "cpp",
+      filename: "photo.png",
+      dataUrl: "data:image/png;base64,cG5nLXBob3Rv"
+    })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /photo path.*inside/i);
+  assert.equal(existsSync(path.join(outsideAssets, "cpp-photo.png")), false);
+});
+
+test("POST /api/photo rejects unsupported image extensions", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/photo`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      resumeId: "cpp",
+      filename: "portrait.gif",
+      dataUrl: `data:image/gif;base64,${Buffer.from("gif-bytes").toString("base64")}`
+    })
+  });
+  const body = await response.json();
+  const reloaded = loadResumeYaml(resumeYamlPath(rootDir));
+
+  assert.equal(response.status, 400);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /Unsupported photo type/);
+  assert.equal(reloaded.profile.photo, "assets/photo.svg");
+});
+
+test("POST /api/photo rejects decoded image bytes above the configured limit", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    photoLimitBytes: 4,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/photo`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      resumeId: "cpp",
+      filename: "portrait.png",
+      dataUrl: `data:image/png;base64,${Buffer.from("too-large").toString("base64")}`
+    })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 413);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /File too large/);
+});
+
+test("GET /api/resumes returns the validated registry", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/resumes`);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.activeId, "cpp");
+  assert.deepEqual(body.resumes.map(({ id, name }) => ({ id, name })), [
+    { id: "cpp", name: "C++ 应届生" },
+    { id: "ai-agent", name: "AI Agent" }
+  ]);
+});
+
+test("POST /api/resumes/duplicate copies YAML and activates the new resume", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/resumes/duplicate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sourceId: "cpp", name: "Backend Engineer" })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(body.resume.id, "backend-engineer");
+  assert.equal(body.activeId, "backend-engineer");
+  assert.equal(loadResumeYaml(path.join(rootDir, "resumes/backend-engineer.yaml")).profile.name, "C++ Candidate");
+  assert.equal(loadResumeYaml(path.join(rootDir, "resumes/cpp.yaml")).profile.name, "C++ Candidate");
+});
+
+test("POST /api/resumes/from-example creates and activates an allowlisted example", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/resumes/from-example`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ exampleId: "ai-agent", name: "Agent Platform" })
+  });
+  const body = await response.json();
+  const created = loadResumeYaml(path.join(rootDir, "resumes/agent-platform.yaml"));
+
+  assert.equal(response.status, 201);
+  assert.equal(body.resume.id, "agent-platform");
+  assert.equal(body.activeId, "agent-platform");
+  assert.equal(created.profile.target, "AI Agent 应用开发工程师");
+});
+
+test("resume lifecycle API renames and activates registered resumes", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const renameResponse = await fetch(`${app.url}/api/resumes/ai-agent`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "AI Agent 校招" })
+  });
+  const renameBody = await renameResponse.json();
+  const activateResponse = await fetch(`${app.url}/api/resumes/ai-agent/activate`, { method: "POST" });
+  const activateBody = await activateResponse.json();
+
+  assert.equal(renameResponse.status, 200);
+  assert.equal(renameBody.resume.name, "AI Agent 校招");
+  assert.equal(renameBody.resume.id, "ai-agent");
+  assert.equal(activateResponse.status, 200);
+  assert.equal(activateBody.activeId, "ai-agent");
+  assert.equal(JSON.parse(readFileSync(path.join(rootDir, "resumes.json"), "utf8")).activeId, "ai-agent");
+});
+
+test("DELETE /api/resumes/:id removes only allowlisted resume data", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  mkdirSync(path.join(rootDir, "backups/cpp"), { recursive: true });
+  mkdirSync(path.join(rootDir, "output/cpp"), { recursive: true });
+  writeFileSync(path.join(rootDir, "backups/cpp/resume-20260710-142530.yaml"), "backup");
+  writeFileSync(path.join(rootDir, "output/cpp/preview.html"), "preview");
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/resumes/cpp`, { method: "DELETE" });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.deletedId, "cpp");
+  assert.equal(body.activeId, "ai-agent");
+  assert.equal(existsSync(path.join(rootDir, "resumes/cpp.yaml")), false);
+  assert.equal(existsSync(path.join(rootDir, "backups/cpp")), false);
+  assert.equal(existsSync(path.join(rootDir, "output/cpp")), false);
+  assert.equal(existsSync(path.join(rootDir, "resumes/ai-agent.yaml")), true);
+  assert.equal(existsSync(path.join(rootDir, "assets/photo.svg")), true);
+});
+
+test("resume lifecycle rejects duplicate names unknown ids and unsafe ids without file changes", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const registryPath = path.join(rootDir, "resumes.json");
+  const before = readFileSync(registryPath, "utf8");
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const duplicateResponse = await fetch(`${app.url}/api/resumes/duplicate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sourceId: "cpp", name: " ai agent " })
+  });
+  const unknownResponse = await fetch(`${app.url}/api/resumes/missing/activate`, { method: "POST" });
+  const unsafeResponse = await fetch(`${app.url}/api/resumes/%2E%2E%2Fcpp`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "Unsafe" })
+  });
+
+  assert.equal(duplicateResponse.status, 400);
+  assert.equal(unknownResponse.status, 400);
+  assert.equal(unsafeResponse.status, 400);
+  assert.equal(readFileSync(registryPath, "utf8"), before);
+  assert.equal(existsSync(path.join(rootDir, "resumes/ai-agent-2.yaml")), false);
+});
+
+test("DELETE /api/resumes/:id rejects deleting the final resume", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  writeFileSync(path.join(rootDir, "resumes.json"), `${JSON.stringify({
+    activeId: "cpp",
+    items: [{ id: "cpp", name: "C++ 应届生", file: "resumes/cpp.yaml" }]
+  }, null, 2)}\n`);
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/resumes/cpp`, { method: "DELETE" });
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /last resume/i);
+  assert.equal(existsSync(path.join(rootDir, "resumes/cpp.yaml")), true);
+});
+
+test("resume save and draft preview are isolated by resumeId", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const aiBefore = readFileSync(resumeYamlPath(rootDir, "ai-agent"), "utf8");
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const updated = structuredClone(validResume);
+  updated.profile.name = "Updated C++ Candidate";
+
+  const saveResponse = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(updated)
+  });
+  const previewResponse = await fetch(`${app.url}/api/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", resume: updated })
+  });
+  const previewBody = await previewResponse.json();
+
+  assert.equal(saveResponse.status, 200);
+  assert.equal(previewResponse.status, 200);
+  assert.match(previewBody.html, /Updated C\+\+ Candidate/);
+  assert.equal(loadResumeYaml(resumeYamlPath(rootDir, "cpp")).profile.name, "Updated C++ Candidate");
+  assert.equal(readFileSync(resumeYamlPath(rootDir, "ai-agent"), "utf8"), aiBefore);
+  assert.equal(existsSync(path.join(rootDir, "backups/ai-agent")), false);
+});
+
+test("resume generation passes resumeId and returns isolated output URLs", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  let receivedOptions;
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    generateResume: async (options) => {
+      receivedOptions = options;
+      return {
+        resumeId: options.resumeId,
+        density: "tight",
+        metrics: { height: 1010 },
+        outputPaths: {
+          preview: path.join(rootDir, "output/ai-agent/preview.html"),
+          pdf: path.join(rootDir, "output/ai-agent/resume.pdf"),
+          png: path.join(rootDir, "output/ai-agent/resume.png")
+        }
+      };
+    },
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "ai-agent" })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(receivedOptions, {
+    projectRoot: PROJECT_ROOT,
+    dataRoot: rootDir,
+    resumeId: "ai-agent"
+  });
+  assert.deepEqual(body.outputs, {
+    pdf: "/output/ai-agent/resume.pdf",
+    png: "/output/ai-agent/resume.png",
+    html: "/output/ai-agent/preview.html"
+  });
+});
+
+test("resume backup listing and restore are isolated by resumeId", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const cppBackup = structuredClone(validResume);
+  cppBackup.profile.name = "Restored C++ Candidate";
+  mkdirSync(path.join(rootDir, "backups/cpp"), { recursive: true });
+  mkdirSync(path.join(rootDir, "backups/ai-agent"), { recursive: true });
+  saveResumeYaml(path.join(rootDir, "backups/cpp/resume-20260710-142530.yaml"), cppBackup);
+  saveResumeYaml(path.join(rootDir, "backups/ai-agent/resume-20260710-142531.yaml"), validResume);
+  const aiBefore = readFileSync(resumeYamlPath(rootDir, "ai-agent"), "utf8");
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const listResponse = await fetch(`${app.url}/api/backups?resumeId=cpp`);
+  const listBody = await listResponse.json();
+  const restoreResponse = await fetch(`${app.url}/api/restore-backup`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      resumeId: "cpp",
+      file: "backups/cpp/resume-20260710-142530.yaml"
+    })
+  });
+
+  assert.equal(listResponse.status, 200);
+  assert.deepEqual(listBody.backups.map((backup) => backup.file), [
+    "backups/cpp/resume-20260710-142530.yaml"
+  ]);
+  assert.equal(restoreResponse.status, 200);
+  assert.equal(loadResumeYaml(resumeYamlPath(rootDir, "cpp")).profile.name, "Restored C++ Candidate");
+  assert.equal(readFileSync(resumeYamlPath(rootDir, "ai-agent"), "utf8"), aiBefore);
+});
+
+test("resume photo upload uses an id-scoped filename without changing other resumes", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const aiBefore = readFileSync(resumeYamlPath(rootDir, "ai-agent"), "utf8");
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/photo`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      resumeId: "cpp",
+      filename: "portrait.png",
+      dataUrl: `data:image/png;base64,${Buffer.from("png-bytes").toString("base64")}`
+    })
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(loadResumeYaml(resumeYamlPath(rootDir, "cpp")).profile.photo, "assets/cpp-photo.png");
+  assert.equal(readFileSync(resumeYamlPath(rootDir, "ai-agent"), "utf8"), aiBefore);
+  assert.equal(existsSync(path.join(rootDir, "assets/cpp-photo.png")), true);
+});
+
+test("resume-scoped APIs reject unknown and path-like resume ids", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    generateResume: async () => {
+      throw new Error("must not generate");
+    },
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const resumeResponse = await fetch(`${app.url}/api/resume?resumeId=${encodeURIComponent("../../x")}`);
+  const generateResponse = await fetch(`${app.url}/api/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "missing" })
+  });
+
+  assert.equal(resumeResponse.status, 400);
+  assert.equal(generateResponse.status, 400);
+});
+
+test("resume-scoped APIs require an explicit resumeId", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const resumeResponse = await fetch(`${app.url}/api/resume`);
+  const previewResponse = await fetch(`${app.url}/api/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resume: validResume })
+  });
+  const generateResponse = await fetch(`${app.url}/api/generate`, { method: "POST" });
+
+  assert.equal(resumeResponse.status, 400);
+  assert.equal(previewResponse.status, 400);
+  assert.equal(generateResponse.status, 400);
+});
+
+test("editor shows the active resume selector in the preview toolbar", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await waitForResumeOption(page, "ai-agent");
+
+  assert.equal(await selectedResumeId(page), "cpp");
+  assert.equal(await page.getAttribute("#addResumeButton", "aria-label"), "新建简历");
+  assert.equal(await page.getAttribute("#manageResumeButton", "aria-label"), "管理当前简历");
+  assert.equal(await page.textContent("#currentFileLabel"), "resumes/cpp.yaml");
+});
+
+test("resume selector menu opens below the trigger when a later item is active", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  await fetch(`${app.url}/api/resumes/ai-agent/activate`, { method: "POST" });
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.click("#resumeSelectButton");
+
+  const geometry = await page.evaluate(() => {
+    const trigger = document.querySelector("#resumeSelectButton").getBoundingClientRect();
+    const menu = document.querySelector("#resumeSelectMenu").getBoundingClientRect();
+    return {
+      triggerBottom: trigger.bottom,
+      menuTop: menu.top,
+      labels: Array.from(document.querySelectorAll("#resumeSelectMenu .resume-select-option-label"))
+        .map((option) => option.textContent.trim()),
+      selectedId: document.querySelector("#resumeSelectMenu [aria-selected='true']")?.dataset.resumeId
+    };
+  });
+
+  assert.ok(geometry.menuTop >= geometry.triggerBottom);
+  assert.deepEqual(geometry.labels, ["C++ 应届生", "AI Agent"]);
+  assert.equal(geometry.selectedId, "ai-agent");
+});
+
+test("editor switches a clean resume and synchronizes form preview and backups", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  mkdirSync(path.join(rootDir, "output/cpp"), { recursive: true });
+  mkdirSync(path.join(rootDir, "output/ai-agent"), { recursive: true });
+  writeFileSync(path.join(rootDir, "output/cpp/preview.html"), renderResumeHtml(loadResumeYaml(resumeYamlPath(rootDir, "cpp")), {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  writeFileSync(path.join(rootDir, "output/ai-agent/preview.html"), renderResumeHtml(loadResumeYaml(resumeYamlPath(rootDir, "ai-agent")), {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  mkdirSync(path.join(rootDir, "backups/ai-agent"), { recursive: true });
+  saveResumeYaml(path.join(rootDir, "backups/ai-agent/resume-20260710-160000.yaml"), validResume);
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await selectResumeOption(page, "ai-agent");
+  await page.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "AI Candidate");
+
+  assert.match(await page.getAttribute("#previewFrame", "src"), /\/output\/ai-agent\/preview\.html/);
+  assert.equal(await page.textContent("#currentFileLabel"), "resumes/ai-agent.yaml");
+  assert.equal(await page.inputValue("#backupSelect"), "backups/ai-agent/resume-20260710-160000.yaml");
+  await page.evaluate(() => {
+    window.__openedResumePdf = "";
+    window.open = (url) => {
+      window.__openedResumePdf = url;
+    };
+  });
+  await page.click("#openPdfButton");
+  assert.equal(await page.evaluate(() => window.__openedResumePdf), "/output/ai-agent/resume.pdf");
+});
+
+test("dirty resume switching supports cancel and discard", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "Unsaved Candidate");
+  await selectResumeOption(page, "ai-agent");
+  await page.waitForSelector("#resumeDialog[open]");
+  assert.match(await page.textContent("#resumeDialogTitle"), /未保存/);
+
+  await page.click("[data-dialog-action='cancel']");
+  assert.equal(await selectedResumeId(page), "cpp");
+  assert.equal(await page.inputValue("[data-path='profile.name']"), "Unsaved Candidate");
+
+  await selectResumeOption(page, "ai-agent");
+  await page.click("[data-dialog-action='discard-switch']");
+  await page.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "AI Candidate");
+  assert.equal(await selectedResumeId(page), "ai-agent");
+});
+
+test("editor duplicates renames and deletes resume variants from toolbar menus", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await waitForResumeOption(page, "ai-agent");
+  await page.click("#addResumeButton");
+  await page.click("[data-resume-action='duplicate']");
+  await page.fill("#resumeDialogInput", "Backend Engineer");
+  await page.click("[data-dialog-action='confirm-duplicate']");
+  await waitForResumeOption(page, "backend-engineer");
+  assert.equal(await selectedResumeId(page), "backend-engineer");
+
+  await page.click("#manageResumeButton");
+  await page.click("[data-resume-action='rename']");
+  await page.fill("#resumeDialogInput", "AI Agent");
+  await page.click("[data-dialog-action='confirm-rename']");
+  assert.match(await page.textContent("#resumeDialogError"), /已有同名简历/);
+  await page.fill("#resumeDialogInput", "Backend 校招");
+  await page.click("[data-dialog-action='confirm-rename']");
+  await page.waitForFunction(() => document.querySelector("#resumeSelectLabel")?.textContent === "Backend 校招");
+
+  await page.click("#manageResumeButton");
+  await page.click("[data-resume-action='delete']");
+  await page.click("[data-dialog-action='confirm-delete-resume']");
+  await page.waitForFunction(() => !document.querySelector("#resumeSelectMenu [data-resume-id='backend-engineer']"));
+  assert.notEqual(await selectedResumeId(page), "backend-engineer");
+});
+
+test("resume toolbar stays inside the preview pane at wide and narrow viewports", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 900 }]) {
+    const page = await openEditorPage(t, { viewport });
+    await page.goto(app.url);
+    await waitForResumeOption(page, "ai-agent");
+
+    const layout = await page.locator(".preview-toolbar").evaluate((toolbar) => ({
+      clientWidth: toolbar.clientWidth,
+      scrollWidth: toolbar.scrollWidth,
+      clientHeight: toolbar.clientHeight,
+      scrollHeight: toolbar.scrollHeight,
+      controls: Array.from(toolbar.querySelectorAll(
+        ".resume-select-button, .toolbar-icon-button, .status-strip, .preview-actions button"
+      )).map((element) => {
+        const rect = element.getBoundingClientRect();
+        const toolbarRect = toolbar.getBoundingClientRect();
+        return {
+          left: rect.left - toolbarRect.left,
+          right: rect.right - toolbarRect.left,
+          top: rect.top - toolbarRect.top,
+          bottom: rect.bottom - toolbarRect.top
+        };
+      })
+    }));
+
+    assert.ok(layout.scrollWidth <= layout.clientWidth);
+    assert.ok(layout.scrollHeight <= layout.clientHeight);
+    assert.ok(layout.controls.every((control) => control.left >= 0 && control.right <= layout.clientWidth + 1));
+    assert.ok(layout.controls.every((control) => control.top >= 0 && control.bottom <= layout.clientHeight + 1));
+  }
+});
+
+test("dirty resume switching saves before activating the target", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "Saved Before Switch");
+  await selectResumeOption(page, "ai-agent");
+  await page.click("[data-dialog-action='save-switch']");
+  await page.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "AI Candidate");
+
+  assert.equal(loadResumeYaml(resumeYamlPath(rootDir, "cpp")).profile.name, "Saved Before Switch");
+  assert.equal(JSON.parse(readFileSync(path.join(rootDir, "resumes.json"), "utf8")).activeId, "ai-agent");
+});
+
+test("failed save keeps the current resume active during switching", async (t) => {
+  let activateCount = 0;
+  const app = await startCustomEditorServer(async (request, response, url) => {
+    if (request.method === "GET" && url.pathname === "/api/resumes") {
+      sendTestJson(response, 200, {
+        ok: true,
+        activeId: "cpp",
+        resumes: [
+          { id: "cpp", name: "C++ 应届生", file: "resumes/cpp.yaml" },
+          { id: "ai-agent", name: "AI Agent", file: "resumes/ai-agent.yaml" }
+        ]
+      });
+      return true;
+    }
+    if (request.method === "GET" && url.pathname === "/api/resume") {
+      sendTestJson(response, 200, { ok: true, resumeId: "cpp", resume: validResume });
+      return true;
+    }
+    if (request.method === "GET" && url.pathname === "/api/examples") {
+      sendTestJson(response, 200, { ok: true, examples: [] });
+      return true;
+    }
+    if (request.method === "GET" && url.pathname === "/api/backups") {
+      sendTestJson(response, 200, { ok: true, backups: [] });
+      return true;
+    }
+    if (request.method === "POST" && url.pathname === "/api/preview") {
+      const body = await readTestJsonBody(request);
+      sendTestJson(response, 200, {
+        ok: true,
+        html: renderResumeHtml(body.resume, { density: "normal", cssPath: "/templates/resume.css" })
+      });
+      return true;
+    }
+    if (request.method === "PUT" && url.pathname === "/api/resume") {
+      sendTestJson(response, 400, { ok: false, error: "Simulated save failure" });
+      return true;
+    }
+    if (request.method === "POST" && url.pathname.endsWith("/activate")) {
+      activateCount += 1;
+      sendTestJson(response, 200, { ok: true });
+      return true;
+    }
+    return false;
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "Unsaved Candidate");
+  await selectResumeOption(page, "ai-agent");
+  await page.click("[data-dialog-action='save-switch']");
+  await page.waitForFunction(() => document.querySelector("#messageLine")?.textContent?.includes("Simulated save failure"));
+
+  assert.equal(await selectedResumeId(page), "cpp");
+  assert.equal(await page.inputValue("[data-path='profile.name']"), "Unsaved Candidate");
+  assert.equal(activateCount, 0);
+});
+
+test("editor creates a resume from an allowlisted example and shows a draft preview", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await waitForResumeOption(page, "ai-agent");
+  await page.click("#addResumeButton");
+  await page.click("[data-resume-action='from-example']");
+  await page.selectOption("#resumeDialogExample", "ai-agent");
+  await page.fill("#resumeDialogInput", "Agent Platform");
+  await page.click("[data-dialog-action='confirm-example']");
+  await page.waitForFunction(() => document.querySelector("[data-path='profile.target']")?.value === "AI Agent 应用开发工程师");
+  await page.waitForFunction(() => document.querySelector("#previewFrame")?.getAttribute("srcdoc")?.includes("AI Agent 应用开发工程师"));
+
+  assert.equal(await selectedResumeId(page), "agent-platform");
+  assert.match(await page.textContent("#statusStrip"), /PDF 待生成|草稿预览/);
+});
+
+test("editor validates resume names and disables deletion of the final resume", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await waitForResumeOption(page, "cpp");
+  await page.click("#manageResumeButton");
+  assert.equal(await page.getAttribute("[data-resume-action='delete']", "aria-disabled"), "true");
+  assert.equal(await page.locator("#deleteResumeHint").isVisible(), true);
+  await page.click("[data-resume-action='rename']");
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => document.activeElement?.id === "manageResumeButton");
+  await page.click("#manageResumeButton");
+  await page.click("[data-resume-action='rename']");
+  await page.fill("#resumeDialogInput", "   ");
+  await page.click("[data-dialog-action='confirm-rename']");
+
+  assert.equal(await page.locator("#resumeDialog").getAttribute("open"), "");
+  assert.match(await page.textContent("#resumeDialogError"), /请输入简历名称/);
+});
+
+test("creating a resume does not discard an unresolved dirty draft", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const registryBefore = readFileSync(path.join(rootDir, "resumes.json"), "utf8");
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "Unresolved Draft");
+  await page.click("#addResumeButton");
+  await page.click("[data-resume-action='from-example']");
+  await page.waitForSelector("#resumeDialog[open]");
+
+  assert.match(await page.textContent("#resumeDialogTitle"), /未保存/);
+  await page.click("[data-dialog-action='cancel']");
+  assert.equal(await page.inputValue("[data-path='profile.name']"), "Unresolved Draft");
+  assert.equal(await selectedResumeId(page), "cpp");
+  assert.equal(readFileSync(path.join(rootDir, "resumes.json"), "utf8"), registryBefore);
+});
+
+test("GET /api/data/export downloads a valid resume data package", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    appVersion: "0.1.0-test",
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/data/export`);
+  const archive = new Uint8Array(await response.arrayBuffer());
+  const files = unzipSync(archive);
+  const manifest = JSON.parse(new TextDecoder().decode(files["manifest.json"]));
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "application/zip");
+  assert.match(response.headers.get("content-disposition"), /attachment; filename="resume-builder-backup-\d{8}-\d{6}\.zip"/);
+  assert.equal(manifest.appVersion, "0.1.0-test");
+  assert.equal(manifest.resumeCount, 1);
+  assert.ok(files["resumes/cpp.yaml"]);
+});
+
+test("data import APIs inspect commit and cancel raw ZIP packages", async (t) => {
+  const sourceRoot = makeMultiResumeFixture();
+  const targetRoot = makeApiFixture();
+  writeFileSync(path.join(targetRoot, "assets/photo.svg"), "<svg>old-target</svg>");
+  const archive = createDataPackage({ dataRoot: sourceRoot, appVersion: "0.1.0" });
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir: targetRoot,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const firstInspect = await fetch(`${app.url}/api/data/import/inspect`, {
+    method: "POST",
+    headers: { "content-type": "application/zip" },
+    body: Buffer.from(archive)
+  });
+  const firstBody = await firstInspect.json();
+  assert.equal(firstInspect.status, 200);
+  assert.equal(firstBody.ok, true);
+  assert.equal(firstBody.summary.resumeCount, 2);
+
+  const cancelResponse = await fetch(`${app.url}/api/data/import/${firstBody.token}`, {
+    method: "DELETE"
+  });
+  assert.equal(cancelResponse.status, 200);
+
+  const secondInspect = await fetch(`${app.url}/api/data/import/inspect`, {
+    method: "POST",
+    headers: { "content-type": "application/zip" },
+    body: Buffer.from(archive)
+  });
+  const secondBody = await secondInspect.json();
+  const commitResponse = await fetch(`${app.url}/api/data/import/commit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: secondBody.token })
+  });
+  const commitBody = await commitResponse.json();
+
+  assert.equal(commitResponse.status, 200);
+  assert.equal(commitBody.ok, true);
+  assert.equal(commitBody.activeId, "cpp");
+  assert.deepEqual(commitBody.resumes.map((resume) => resume.id), ["cpp", "ai-agent"]);
+  assert.match(commitBody.preImportBackup, /^resume-editor-test-.*\.pre-import-\d{8}-\d{6}$/);
+  assert.equal(existsSync(path.join(targetRoot, "output")), false);
+  assert.equal(
+    readFileSync(path.join(path.dirname(targetRoot), commitBody.preImportBackup, "assets/photo.svg"), "utf8"),
+    "<svg>old-target</svg>"
+  );
+});
+
+test("POST /api/data/import/inspect rejects oversized raw archives", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    dataArchiveLimitBytes: 8,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/data/import/inspect`, {
+    method: "POST",
+    headers: { "content-type": "application/zip" },
+    body: Buffer.from("0123456789")
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 413);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /archive.*too large/i);
+});
+
+test("editor server blocks mutations during an import commit and disposes its manager", async (t) => {
+  const rootDir = makeApiFixture();
+  let disposed = false;
+  const dataImportManager = {
+    inspect() {
+      throw new Error("not used");
+    },
+    commit() {
+      throw new Error("not used");
+    },
+    cancel() {
+      return false;
+    },
+    isCommitting() {
+      return true;
+    },
+    dispose() {
+      disposed = true;
+    }
+  };
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    dataImportManager,
+    log: false
+  });
+
+  const blocked = await fetch(`${app.url}/api/resume?resumeId=cpp`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(validResume)
+  });
+  const blockedBody = await blocked.json();
+  const readable = await fetch(`${app.url}/api/resumes`);
+
+  assert.equal(blocked.status, 423);
+  assert.match(blockedBody.error, /data import.*in progress/i);
+  assert.equal(readable.status, 200);
+  await app.close();
+  assert.equal(disposed, true);
+  t.after(async () => {
+    if (app.server.listening) {
+      await app.close();
+    }
+  });
+});
+
+test("data import commit rejects while an earlier generation is still writing", async (t) => {
+  const sourceRoot = makeMultiResumeFixture();
+  const targetRoot = makeApiFixture();
+  const archive = createDataPackage({ dataRoot: sourceRoot, appVersion: "0.1.0" });
+  let markGenerationStarted;
+  let releaseGeneration;
+  const generationStarted = new Promise((resolve) => {
+    markGenerationStarted = resolve;
+  });
+  const generationBlocked = new Promise((resolve) => {
+    releaseGeneration = resolve;
+  });
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir: targetRoot,
+    generateResume: async () => {
+      markGenerationStarted();
+      await generationBlocked;
+      return { density: "normal", metrics: { height: 900 } };
+    },
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const inspectResponse = await fetch(`${app.url}/api/data/import/inspect`, {
+    method: "POST",
+    headers: { "content-type": "application/zip" },
+    body: Buffer.from(archive)
+  });
+  const inspected = await inspectResponse.json();
+  const generationRequest = fetch(`${app.url}/api/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp" })
+  });
+  await generationStarted;
+
+  const blockedCommit = await fetch(`${app.url}/api/data/import/commit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: inspected.token })
+  });
+  const blockedBody = await blockedCommit.json();
+  releaseGeneration();
+  const generationResponse = await generationRequest;
+
+  assert.equal(blockedCommit.status, 423);
+  assert.match(blockedBody.error, /write.*in progress/i);
+  assert.equal(generationResponse.status, 200);
+
+  const retriedCommit = await fetch(`${app.url}/api/data/import/commit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: inspected.token })
+  });
+  assert.equal(retriedCommit.status, 200);
+});
+
+test("data import commit stays blocked after a generating client disconnects", async (t) => {
+  const sourceRoot = makeMultiResumeFixture();
+  const targetRoot = makeApiFixture();
+  const archive = createDataPackage({ dataRoot: sourceRoot, appVersion: "0.1.0" });
+  let markGenerationStarted;
+  let releaseGeneration;
+  const generationStarted = new Promise((resolve) => {
+    markGenerationStarted = resolve;
+  });
+  const generationBlocked = new Promise((resolve) => {
+    releaseGeneration = resolve;
+  });
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir: targetRoot,
+    generateResume: async () => {
+      markGenerationStarted();
+      await generationBlocked;
+      return { density: "normal", metrics: { height: 900 } };
+    },
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const inspectResponse = await fetch(`${app.url}/api/data/import/inspect`, {
+    method: "POST",
+    headers: { "content-type": "application/zip" },
+    body: Buffer.from(archive)
+  });
+  const inspected = await inspectResponse.json();
+  const generationRequest = http.request(`${app.url}/api/generate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" }
+  });
+  generationRequest.on("error", () => {});
+  const generationConnectionClosed = new Promise((resolve) => {
+    generationRequest.once("close", resolve);
+  });
+  generationRequest.end(JSON.stringify({ resumeId: "cpp" }));
+  await generationStarted;
+  generationRequest.destroy();
+  await generationConnectionClosed;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const blockedCommit = await fetch(`${app.url}/api/data/import/commit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: inspected.token })
+  });
+  const blockedBody = await blockedCommit.json();
+  releaseGeneration();
+
+  assert.equal(blockedCommit.status, 423);
+  assert.match(blockedBody.error, /write.*in progress/i);
+
+  const retriedCommit = await fetch(`${app.url}/api/data/import/commit`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: inspected.token })
+  });
+  assert.equal(retriedCommit.status, 200);
+});
+
+test("editor data management menu exports an unencrypted package without changing the resume", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t, { acceptDownloads: true });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+
+  assert.equal(await page.locator(".preview-toolbar #dataManagerButton").count(), 1);
+  assert.equal(await page.locator(".editor-pane #dataManagerButton").count(), 0);
+  await page.click("#dataManagerButton");
+  assert.deepEqual(await page.locator("#dataManagerMenu button").allTextContents(), [
+    "导出数据包",
+    "导入数据包"
+  ]);
+  await page.click("#exportDataButton");
+  assert.match(await page.textContent("#dataDialog"), /包含个人信息/);
+  assert.match(await page.textContent("#dataDialog"), /未加密/);
+
+  const downloadPromise = page.waitForEvent("download");
+  await page.click("#dataDialogPrimary");
+  const download = await downloadPromise;
+
+  assert.match(download.suggestedFilename(), /^resume-builder-backup-\d{8}-\d{6}\.zip$/);
+  assert.equal(await page.getAttribute("#resumeSelectButton", "data-value"), "cpp");
+  assert.equal(await page.locator("[data-path='profile.name']").inputValue(), "测试候选人");
+});
+
+test("editor blocks data import while the current resume has unsaved changes", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "未保存姓名");
+
+  await page.click("#dataManagerButton");
+  await page.click("#importDataButton");
+
+  assert.match(await page.textContent("#messageLine"), /先保存或撤销/);
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "saveButton");
+  assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), false);
+});
+
+test("editor inspects and commits an imported package then reloads the draft preview", async (t) => {
+  const sourceRoot = makeMultiResumeFixture();
+  const targetRoot = makeApiFixture();
+  const archive = createDataPackage({
+    dataRoot: sourceRoot,
+    appVersion: "0.1.0",
+    now: () => new Date("2026-07-10T15:30:00.000Z")
+  });
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir: targetRoot,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+
+  await page.click("#dataManagerButton");
+  const chooserPromise = page.waitForEvent("filechooser");
+  await page.click("#importDataButton");
+  const chooser = await chooserPromise;
+  const inspectResponse = page.waitForResponse((response) => response.url().endsWith("/api/data/import/inspect"));
+  await chooser.setFiles({
+    name: "resume-builder-backup.zip",
+    mimeType: "application/zip",
+    buffer: Buffer.from(archive)
+  });
+  await inspectResponse;
+
+  assert.match(await page.textContent("#dataDialog"), /2026-07-10/);
+  assert.match(await page.textContent("#dataDialog"), /2 份简历/);
+  assert.match(await page.textContent("#dataDialog"), /C\+\+ 应届生/);
+  assert.match(await page.textContent("#dataDialog"), /AI Agent/);
+
+  const commitResponse = page.waitForResponse((response) => response.url().endsWith("/api/data/import/commit"));
+  await page.click("#dataDialogPrimary");
+  await commitResponse;
+  await page.waitForFunction(() => document.querySelector("#resumeSelectButton")?.dataset.value === "cpp");
+  await page.waitForSelector("[data-path='profile.name']");
+
+  assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), false);
+  assert.equal(await page.getAttribute("#resumeSelectButton", "data-value"), "cpp");
+  assert.equal(await page.locator("#resumeSelectMenu [data-resume-id='ai-agent']").count(), 1);
+  assert.match(await page.textContent("#statusStrip"), /PDF 待生成/);
+  assert.match(await page.textContent("#messageLine"), /导入完成/);
+});

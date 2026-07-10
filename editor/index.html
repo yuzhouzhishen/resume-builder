@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>简历编辑器</title>
+  <link rel="stylesheet" href="/editor/styles.css">
+</head>
+<body>
+  <div id="app" class="workspace">
+    <section class="preview-pane" aria-label="简历预览">
+      <header class="preview-toolbar">
+        <div class="preview-toolbar-primary">
+          <div class="resume-switcher">
+            <div class="resume-select-control">
+              <button class="resume-select-button" type="button" id="resumeSelectButton" aria-label="当前简历" aria-haspopup="listbox" aria-expanded="false" aria-controls="resumeSelectMenu">
+                <span id="resumeSelectLabel">读取中</span>
+                <span class="resume-select-chevron" aria-hidden="true">▾</span>
+              </button>
+              <div class="resume-select-menu" id="resumeSelectMenu" role="listbox" aria-label="选择简历" hidden></div>
+            </div>
+            <button class="toolbar-icon-button" type="button" id="addResumeButton" aria-label="新建简历" title="新建简历">+</button>
+            <button class="toolbar-icon-button" type="button" id="manageResumeButton" aria-label="管理当前简历" title="管理当前简历">⋯</button>
+            <div class="toolbar-menu" id="addResumeMenu" hidden>
+              <button type="button" data-resume-action="duplicate">复制当前简历</button>
+              <button type="button" data-resume-action="from-example">从样例新建</button>
+            </div>
+            <div class="toolbar-menu toolbar-menu-right" id="manageResumeMenu" hidden>
+              <button type="button" data-resume-action="rename">重命名</button>
+              <button class="menu-danger" type="button" data-resume-action="delete" aria-describedby="deleteResumeHint">删除</button>
+              <p class="toolbar-menu-hint" id="deleteResumeHint" hidden>至少需要保留一份简历</p>
+            </div>
+          </div>
+          <div class="data-manager">
+            <button class="ghost-button toolbar-command-button" type="button" id="dataManagerButton" aria-haspopup="menu" aria-expanded="false" aria-controls="dataManagerMenu">数据管理</button>
+            <div class="toolbar-menu toolbar-menu-data" id="dataManagerMenu" role="menu" hidden>
+              <button type="button" id="exportDataButton" role="menuitem">导出数据包</button>
+              <button type="button" id="importDataButton" role="menuitem">导入数据包</button>
+            </div>
+            <input id="dataImportInput" type="file" accept=".zip,application/zip" hidden>
+          </div>
+          <div class="status-strip" id="statusStrip">
+            <span>密度：--</span>
+            <span>A4 单页</span>
+            <span>读取中</span>
+            <span>待生成</span>
+          </div>
+        </div>
+        <div class="preview-actions">
+          <button class="ghost-button" type="button" id="refreshPreviewButton">刷新预览</button>
+          <button class="ghost-button" type="button" id="openPdfButton">打开 PDF</button>
+        </div>
+      </header>
+      <div class="preview-stage">
+        <div class="a4-frame">
+          <iframe id="previewFrame" title="简历预览" src="about:blank"></iframe>
+        </div>
+      </div>
+    </section>
+
+    <aside class="editor-pane" aria-label="简历内容编辑">
+      <header class="editor-header">
+        <div>
+          <h1>简历编辑器</h1>
+          <p id="currentFileLabel">resumes/--.yaml</p>
+        </div>
+        <button class="primary-button" type="button" id="saveButton">保存</button>
+      </header>
+
+      <nav class="module-tabs" id="moduleTabs" aria-label="编辑模块"></nav>
+
+      <main class="form-scroll">
+        <form id="editorForm"></form>
+      </main>
+
+      <footer class="action-bar">
+        <div class="footer-group example-actions">
+          <select id="exampleSelect" aria-label="样例"></select>
+          <button class="ghost-button" type="button" id="loadExampleButton">载入样例</button>
+        </div>
+        <div class="footer-group backup-actions">
+          <select id="backupSelect" aria-label="最近备份"></select>
+          <button class="ghost-button" type="button" id="restoreBackupButton">恢复备份</button>
+        </div>
+        <button class="primary-button" type="button" id="generateButton">生成 PDF</button>
+      </footer>
+
+      <div class="message-line" id="messageLine" role="status"></div>
+    </aside>
+  </div>
+
+  <dialog class="resume-dialog" id="resumeDialog" aria-labelledby="resumeDialogTitle">
+    <div class="dialog-content">
+      <header class="dialog-header">
+        <h2 id="resumeDialogTitle"></h2>
+        <button class="dialog-close-button" type="button" id="resumeDialogClose" aria-label="关闭" title="关闭">×</button>
+      </header>
+      <p class="dialog-description" id="resumeDialogDescription"></p>
+      <div class="dialog-fields" id="resumeDialogFields">
+        <label class="dialog-field" id="resumeDialogExampleField" hidden>
+          <span>样例</span>
+          <select id="resumeDialogExample"></select>
+        </label>
+        <label class="dialog-field" id="resumeDialogInputField" hidden>
+          <span>简历名称</span>
+          <input id="resumeDialogInput" type="text" maxlength="120" autocomplete="off">
+        </label>
+      </div>
+      <p class="dialog-error" id="resumeDialogError" role="alert"></p>
+      <footer class="dialog-actions" id="resumeDialogActions"></footer>
+    </div>
+  </dialog>
+
+  <dialog class="resume-dialog data-dialog" id="dataDialog" aria-labelledby="dataDialogTitle">
+    <div class="dialog-content">
+      <header class="dialog-header">
+        <h2 id="dataDialogTitle">数据管理</h2>
+        <button class="dialog-close-button" type="button" id="dataDialogClose" aria-label="关闭" title="关闭">×</button>
+      </header>
+      <div class="data-dialog-body" id="dataDialogBody"></div>
+      <p class="dialog-error" id="dataDialogError" role="alert"></p>
+      <footer class="dialog-actions data-dialog-actions">
+        <button class="dialog-secondary-button" type="button" id="dataDialogCancel">取消</button>
+        <button class="dialog-primary-button" type="button" id="dataDialogPrimary">确认</button>
+      </footer>
+    </div>
+  </dialog>
+  <script type="module" src="/editor/app.js"></script>
+</body>
+</html>

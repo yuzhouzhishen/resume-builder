@@ -1,0 +1,48 @@
+profile:
+  name: 示例候选人
+  target: AI Agent 应用开发工程师
+  school: 示例理工大学（应届生）
+  major: 计算机科学与技术
+  phone: 000-0000-0000
+  email: candidate@example.com
+  photo: assets/photo.svg
+
+layout:
+  sectionOrder:
+    - skills
+    - internships
+    - projects
+
+skills:
+  - title: LLM 应用开发
+    items:
+      - 了解多轮对话、上下文管理、结构化输出和流式响应。
+      - 了解文档切分、向量检索、上下文拼接等 RAG 基础流程。
+  - title: Agent 与工具调用
+    items:
+      - 熟悉 Tool Calling 思路，能够将业务接口封装为结构化工具。
+      - 了解 MCP Server、Tools、Resources 和 Prompts 等基础概念。
+
+internships:
+  - start: 2025.07
+    end: 2025.10
+    organization: 示例智能设备有限公司
+    role: 应用开发实习生
+    summary: 参与设备查询与诊断能力的工具化接入。
+    items:
+      - 将设备状态查询和控制接口整理为带参数校验的工具定义。
+      - 为异步请求增加超时处理、错误映射和日志追踪。
+    linkLabel: 项目说明
+    link: https://example.com/agent-internship
+
+projects:
+  - start: 2025.08
+    end: 2025.11
+    name: 设备 Agent 工具网关
+    role: Agent 应用开发
+    summary: 构建设备能力与大模型之间的本地工具调用层。
+    items:
+      - 实现设备信息、端口状态和诊断数据等示例工具。
+      - 使用请求 ID 管理异步响应，并补充超时和重试策略。
+    linkLabel: 项目说明
+    link: https://example.com/agent-gateway

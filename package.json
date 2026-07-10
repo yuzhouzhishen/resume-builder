@@ -1,0 +1,19 @@
+{
+  "name": "resume-builder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "editor": "node scripts/editor-server.mjs",
+    "test": "node --test scripts/app-paths.test.mjs scripts/data-root.test.mjs scripts/resume-registry.test.mjs scripts/data-package.test.mjs && node --test --test-concurrency=1 --test-timeout=10000 scripts/editor-server.test.mjs && node --test scripts/render.test.mjs"
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "js-yaml": "^4.1.0",
+    "playwright": "^1.55.0"
+  }
+}

@@ -1,0 +1,48 @@
+profile:
+  name: 示例候选人
+  target: C++开发工程师
+  school: 示例理工大学（应届生）
+  major: 计算机科学与技术
+  phone: 000-0000-0000
+  email: candidate@example.com
+  photo: assets/photo.svg
+
+layout:
+  sectionOrder:
+    - internships
+    - skills
+    - projects
+
+skills:
+  - title: C/C++编程
+    items:
+      - 掌握 C++ 基础语法、面向对象、模板及常用标准库组件。
+      - 了解智能指针、右值引用、lambda 和多线程等现代 C++ 特性。
+  - title: Linux 与网络编程
+    items:
+      - 熟悉 Linux 常用工具、进程线程、基础 I/O 和同步机制。
+      - 了解 TCP、UDP、HTTP、MQTT 和 Protobuf 等通信协议。
+
+internships:
+  - start: 2025.07
+    end: 2025.10
+    organization: 示例科技有限公司
+    role: 软件开发实习生
+    summary: 参与嵌入式设备通信与任务调度模块开发。
+    items:
+      - 使用事件队列重构周期任务，减少空闲唤醒并提升状态处理可测试性。
+      - 为通信模块补充超时、重试和请求响应匹配机制。
+    linkLabel: 项目说明
+    link: https://example.com/cpp-internship
+
+projects:
+  - start: 2025.03
+    end: 2025.06
+    name: 并发内存池实验
+    role: C++开发
+    summary: 实现面向学习场景的线程缓存与中央缓存原型。
+    items:
+      - 按对象大小划分空闲链表，并使用批量申请减少锁竞争。
+      - 增加页面回收与基础性能测试，记录不同负载下的内存占用。
+    linkLabel: 项目说明
+    link: https://example.com/memory-pool

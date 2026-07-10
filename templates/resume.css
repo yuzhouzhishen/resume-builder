@@ -1,0 +1,263 @@
+@page {
+  size: A4;
+  margin: 0;
+}
+
+:root {
+  --page-width: 210mm;
+  --page-height: 297mm;
+  --page-x: 8mm;
+  --page-y: 6mm;
+  --body-size: 10.8pt;
+  --body-line-height: 1.38;
+  --item-gap: 3px;
+  --section-gap: 8px;
+  --experience-gap: 5px;
+  --bullet-indent: 16px;
+  --text: #27282d;
+  --muted: #4a4d54;
+  --bar: #eeeeef;
+  --rule: #272633;
+  --link: #0659d9;
+}
+
+body[data-density="normal"] {
+  --body-size: 10.8pt;
+  --body-line-height: 1.38;
+  --item-gap: 3px;
+  --section-gap: 8px;
+  --experience-gap: 5px;
+  --bullet-indent: 16px;
+}
+
+body[data-density="compact"] {
+  --body-size: 10.5pt;
+  --body-line-height: 1.32;
+  --item-gap: 2px;
+  --section-gap: 6px;
+  --experience-gap: 4px;
+  --bullet-indent: 15px;
+}
+
+body[data-density="tight"] {
+  --body-size: 10.2pt;
+  --body-line-height: 1.25;
+  --item-gap: 1px;
+  --section-gap: 4px;
+  --experience-gap: 3px;
+  --bullet-indent: 14px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #f4f4f4;
+  color: var(--text);
+  font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", Arial, sans-serif;
+  font-size: var(--body-size);
+  line-height: var(--body-line-height);
+  letter-spacing: 0;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+.page {
+  position: relative;
+  width: var(--page-width);
+  height: var(--page-height);
+  margin: 0 auto;
+  padding: var(--page-y) var(--page-x);
+  overflow: hidden;
+  background: #fff;
+}
+
+.profile {
+  position: relative;
+  min-height: 29mm;
+  padding: 2mm 31mm 2mm 4mm;
+}
+
+.profile-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: 10mm;
+  row-gap: 2.2mm;
+  max-width: 155mm;
+  font-size: 12.3pt;
+  line-height: 1.22;
+  font-weight: 700;
+}
+
+.profile-grid span {
+  font-weight: 700;
+}
+
+.photo {
+  position: absolute;
+  top: 0;
+  right: 9mm;
+  width: 22mm;
+  height: 29.5mm;
+  object-fit: cover;
+  display: block;
+}
+
+.section {
+  margin-top: var(--section-gap);
+}
+
+.section-title {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 8.4mm;
+  margin: 0 0 5mm;
+  padding-left: 5.2mm;
+  background: var(--bar);
+  color: #262832;
+  font-size: 14pt;
+  line-height: 1;
+  font-weight: 500;
+}
+
+.section-title::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1.3mm;
+  height: 100%;
+  background: var(--rule);
+}
+
+.skill-group {
+  margin: 0 0 3.2mm 5.8mm;
+}
+
+.skill-group h3 {
+  margin: 0 0 1.8mm;
+  font-size: 12.6pt;
+  line-height: 1.15;
+  font-weight: 800;
+}
+
+.item-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.item-list li {
+  position: relative;
+  margin: 0 0 var(--item-gap);
+  padding-left: var(--bullet-indent);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.item-list li::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0.62em;
+  width: 4.2px;
+  height: 4.2px;
+  border-radius: 50%;
+  background: #303238;
+}
+
+.experience {
+  margin: 0 0 var(--experience-gap);
+}
+
+.experience-header {
+  display: grid;
+  grid-template-columns: 40mm minmax(0, 1fr) 38mm;
+  gap: 2mm;
+  align-items: baseline;
+  margin: 0 0 2.1mm;
+  font-size: 13pt;
+  line-height: 1.15;
+  font-weight: 800;
+  color: #111217;
+}
+
+.experience-title {
+  text-align: center;
+}
+
+.experience-time,
+.experience-role {
+  white-space: nowrap;
+}
+
+.experience-role {
+  text-align: right;
+}
+
+.experience-summary {
+  margin: 0 0 2mm;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.project-link {
+  margin: 1.3mm 0 3.2mm;
+  color: #3775bb;
+  overflow-wrap: anywhere;
+}
+
+.project-link a {
+  color: var(--link);
+  text-decoration: underline;
+}
+
+@media screen {
+  .page {
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.08), 0 18px 48px rgba(0, 0, 0, 0.16);
+  }
+
+  html[data-preview-interactive="true"] [data-section] {
+    cursor: pointer;
+    outline: none;
+  }
+
+  html[data-preview-interactive="true"] [data-path] {
+    cursor: pointer;
+    outline: none;
+    transition: background-color 120ms ease;
+  }
+
+  html[data-preview-interactive="true"] [data-path]:not(.skill-group):not(.experience):hover {
+    background: rgb(32 87 214 / 6%);
+  }
+
+  html[data-preview-interactive="true"] [data-path]:not(.skill-group):not(.experience).is-preview-selected {
+    background: rgb(32 87 214 / 10%);
+  }
+}
+
+@media print {
+  html,
+  body {
+    width: var(--page-width);
+    height: var(--page-height);
+    background: #fff;
+  }
+
+  .page {
+    margin: 0;
+    box-shadow: none;
+  }
+
+  [data-section] {
+    outline: none !important;
+    box-shadow: none !important;
+  }
+}
