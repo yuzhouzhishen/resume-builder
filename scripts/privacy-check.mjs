@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import path from "node:path";
+import { TextDecoder } from "node:util";
 import { pathToFileURL } from "node:url";
 
 const PRIVATE_PATHS = new Set([
@@ -20,6 +21,7 @@ const ALLOWED_EMAIL_DOMAINS = new Set([
 const ALLOWED_EMAILS = new Set(["noreply@github.com"]);
 const MAX_TEXT_BLOB_BYTES = 2 * 1024 * 1024;
 const BLOB_BATCH_SIZE = 32;
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 function isAllowedEmail(email) {
   if (ALLOWED_EMAILS.has(email.toLowerCase())) return true;
@@ -86,6 +88,21 @@ function textViolation(rule, source, line) {
     line,
     message: `${source}:${line}: sensitive content (${rule})`
   };
+}
+
+function isBinaryBuffer(buffer) {
+  if (buffer.includes(0)) return true;
+
+  try {
+    UTF8_DECODER.decode(buffer);
+  } catch {
+    return true;
+  }
+
+  return buffer.some((byte) => (
+    (byte < 32 && byte !== 9 && byte !== 10 && byte !== 12 && byte !== 13)
+    || byte === 127
+  ));
 }
 
 export function findTextViolations(text, { source = "<text>" } = {}) {
@@ -173,6 +190,7 @@ function readHistoryPaths(root) {
   const output = git(root, [
     "log",
     "--all",
+    "-m",
     "--name-only",
     "--format=",
     "--no-renames",
@@ -321,7 +339,7 @@ export function scanRepository(root = process.cwd()) {
 
   for (const [objectId, buffer] of blobs) {
     const { filePath, scope } = objectSources.get(objectId);
-    if (buffer.includes(0)) {
+    if (isBinaryBuffer(buffer)) {
       violations.push(objectContentViolation(
         "binary-content",
         { filePath, scope },

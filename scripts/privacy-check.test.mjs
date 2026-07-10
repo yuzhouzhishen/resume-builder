@@ -12,7 +12,11 @@ import {
 } from "./privacy-check.mjs";
 
 function git(root, ...args) {
-  return execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  return execFileSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  }).trim();
 }
 
 function makeRepository({ email = "tester@users.noreply.github.com" } = {}) {
@@ -173,6 +177,40 @@ test("history rejects a private path that reused an existing public blob", () =>
   );
 });
 
+test("history rejects a private path introduced and removed only by merge commits", () => {
+  const root = makeRepository();
+  writeFileSync(path.join(root, "README.md"), "public fixture\n");
+  commitAll(root, "Base fixture");
+
+  git(root, "checkout", "-b", "right");
+  writeFileSync(path.join(root, "right.txt"), "right\n");
+  commitAll(root, "Right parent");
+  git(root, "checkout", "main");
+  writeFileSync(path.join(root, "left.txt"), "left\n");
+  commitAll(root, "Left parent");
+  git(root, "merge", "--no-ff", "--no-commit", "right");
+  mkdirSync(path.join(root, "resumes"));
+  writeFileSync(path.join(root, "resumes", "private.yaml"), "merge-only fixture\n");
+  commitAll(root, "Merge with forbidden path");
+
+  git(root, "checkout", "-b", "cleanup-side");
+  writeFileSync(path.join(root, "side.txt"), "side\n");
+  commitAll(root, "Cleanup side parent");
+  git(root, "checkout", "main");
+  writeFileSync(path.join(root, "main.txt"), "main\n");
+  commitAll(root, "Cleanup main parent");
+  git(root, "merge", "--no-ff", "--no-commit", "cleanup-side");
+  rmSync(path.join(root, "resumes"), { recursive: true });
+  commitAll(root, "Merge removing forbidden path");
+
+  const result = scanRepository(root);
+
+  assert.equal(
+    result.violations.some(({ rule, scope }) => rule === "private-path" && scope === "history"),
+    true
+  );
+});
+
 test("current scan reads staged content instead of an unstaged worktree replacement", () => {
   const root = makeRepository();
   const filePath = path.join(root, "README.md");
@@ -215,7 +253,9 @@ test("GitHub generated noreply commit metadata is allowed", () => {
 
 test("extensionless binary and oversized text blobs are rejected", () => {
   const root = makeRepository();
-  writeFileSync(path.join(root, "payload"), Buffer.from([0, 1, 2, 3]));
+  const binary = Buffer.from([1, 2, 3, 4]);
+  assert.equal(binary.includes(0), false);
+  writeFileSync(path.join(root, "payload"), binary);
   writeFileSync(path.join(root, "large.txt"), "x".repeat(2 * 1024 * 1024 + 1));
   commitAll(root, "Add opaque fixtures");
 
