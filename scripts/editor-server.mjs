@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { generateResume as defaultGenerateResume, renderResumeHtml } from "./generate.mjs";
 import { resolveAppPaths } from "./app-paths.mjs";
 import { createDataImportManager, createDataPackage } from "./data-package.mjs";
+import { createDataRecoveryManager } from "./data-recovery.mjs";
 import { ensureDataRoot } from "./data-root.mjs";
 import { resolvePathInside } from "./path-safety.mjs";
 import {
@@ -344,7 +345,7 @@ async function handleDataImportCommitApi(
 
   try {
     const body = await readJsonBody(request, bodyLimitBytes);
-    const result = dataImportManager.commit(body.token);
+    const result = await dataImportManager.commit(body.token);
     sendJson(response, 200, resumeRegistryResponse(result.registry, {
       preImportBackup: path.basename(result.preImportBackup),
       generation: "needs generate"
@@ -367,13 +368,79 @@ function handleDataImportCancelApi(request, response, dataImportManager, token) 
   sendJson(response, 200, { ok: true });
 }
 
-function createDataMutationGate(dataImportManager) {
+function sendDataRecoveryError(response, error) {
+  const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 0;
+  if (
+    statusCode >= 400
+    && statusCode <= 599
+    && typeof error?.code === "string"
+    && typeof error?.message === "string"
+  ) {
+    sendJson(response, statusCode, {
+      ok: false,
+      error: error.message,
+      code: error.code
+    });
+    return;
+  }
+  sendJson(response, 500, {
+    ok: false,
+    error: "Data recovery failed.",
+    code: "recovery-failed"
+  });
+}
+
+async function handleDataRecoverySnapshotsApi(request, response, dataRecoveryManager) {
+  if (request.method !== "GET") {
+    sendJson(response, 405, { ok: false, error: "Method not allowed." });
+    return;
+  }
+
+  try {
+    const snapshots = await dataRecoveryManager.list();
+    sendJson(response, 200, { ok: true, snapshots });
+  } catch (error) {
+    sendDataRecoveryError(response, error);
+  }
+}
+
+async function handleDataRecoveryRestoreApi(
+  request,
+  response,
+  dataRecoveryManager,
+  bodyLimitBytes
+) {
+  if (request.method !== "POST") {
+    sendJson(response, 405, { ok: false, error: "Method not allowed." });
+    return;
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(request, bodyLimitBytes);
+  } catch (error) {
+    sendJson(response, error.statusCode || 400, { ok: false, error: error.message });
+    return;
+  }
+
+  try {
+    const result = await dataRecoveryManager.restore(body.snapshotId);
+    sendJson(response, 200, resumeRegistryResponse(result.registry, {
+      preRestoreBackup: path.basename(result.preRestoreBackup),
+      generation: "needs generate"
+    }));
+  } catch (error) {
+    sendDataRecoveryError(response, error);
+  }
+}
+
+function createDataMutationGate({ isReplacing }) {
   let activeMutations = 0;
-  let importCommitPending = false;
+  let replacementPending = false;
 
   return {
     beginMutation() {
-      if (importCommitPending || dataImportManager.isCommitting()) {
+      if (replacementPending || isReplacing()) {
         return false;
       }
       activeMutations += 1;
@@ -382,24 +449,24 @@ function createDataMutationGate(dataImportManager) {
     endMutation() {
       activeMutations = Math.max(0, activeMutations - 1);
     },
-    beginImportCommit() {
-      if (importCommitPending || dataImportManager.isCommitting() || activeMutations > 0) {
+    beginReplacement() {
+      if (replacementPending || isReplacing() || activeMutations > 0) {
         return false;
       }
-      importCommitPending = true;
+      replacementPending = true;
       return true;
     },
-    endImportCommit() {
-      importCommitPending = false;
+    endReplacement() {
+      replacementPending = false;
     },
-    isImportLocked() {
-      return importCommitPending || dataImportManager.isCommitting();
+    isReplacementLocked() {
+      return replacementPending || isReplacing();
     }
   };
 }
 
-function isBlockedByDataImport(request, url, mutationGate) {
-  if (!mutationGate.isImportLocked() || !url.pathname.startsWith("/api/")) {
+function isBlockedByDataReplacement(request, url, mutationGate) {
+  if (!mutationGate.isReplacementLocked() || !url.pathname.startsWith("/api/")) {
     return false;
   }
   if (request.method === "GET" && url.pathname !== "/api/data/export") {
@@ -412,7 +479,11 @@ function isOfficialDataMutation(request, url) {
   if (!url.pathname.startsWith("/api/") || request.method === "GET") {
     return false;
   }
-  if (url.pathname === "/api/preview" || url.pathname.startsWith("/api/data/import/")) {
+  if (
+    url.pathname === "/api/preview"
+    || url.pathname.startsWith("/api/data/import/")
+    || url.pathname.startsWith("/api/data/recovery/")
+  ) {
     return false;
   }
   return true;
@@ -424,7 +495,10 @@ async function runWithOfficialDataMutation(request, response, url, mutationGate,
     return;
   }
   if (!mutationGate.beginMutation()) {
-    sendJson(response, 423, { ok: false, error: "Data import is in progress. Try again shortly." });
+    sendJson(response, 423, {
+      ok: false,
+      error: "Data replacement is in progress. Try again shortly."
+    });
     return;
   }
   try {
@@ -886,7 +960,11 @@ export function createEditorServer(options = {}) {
     dataRoot,
     limits: { maxArchiveBytes: dataArchiveLimitBytes }
   });
-  const mutationGate = createDataMutationGate(dataImportManager);
+  const dataRecoveryManager = options.dataRecoveryManager || createDataRecoveryManager({ dataRoot });
+  const mutationGate = createDataMutationGate({
+    isReplacing: () => dataImportManager.isCommitting()
+      || dataRecoveryManager.isRestoring()
+  });
   const appVersion = options.appVersion || "0.1.0";
 
   const server = http.createServer(async (request, response) => {
@@ -918,23 +996,47 @@ export function createEditorServer(options = {}) {
     }
 
     if (url.pathname === "/api/data/import/commit") {
-      if (!mutationGate.beginImportCommit()) {
+      if (!mutationGate.beginReplacement()) {
         sendJson(response, 423, {
           ok: false,
-          error: "A resume data write is already in progress. Retry the import shortly."
+          error: "A resume data replacement or write is already in progress. Retry shortly."
         });
         return;
       }
       try {
         await handleDataImportCommitApi(request, response, dataImportManager, bodyLimitBytes);
       } finally {
-        mutationGate.endImportCommit();
+        mutationGate.endReplacement();
       }
       return;
     }
 
-    if (isBlockedByDataImport(request, url, mutationGate)) {
-      sendJson(response, 423, { ok: false, error: "Data import is in progress. Try again shortly." });
+    if (url.pathname === "/api/data/recovery/restore") {
+      if (!mutationGate.beginReplacement()) {
+        sendJson(response, 423, {
+          ok: false,
+          error: "A resume data replacement or write is already in progress. Retry shortly."
+        });
+        return;
+      }
+      try {
+        await handleDataRecoveryRestoreApi(
+          request,
+          response,
+          dataRecoveryManager,
+          bodyLimitBytes
+        );
+      } finally {
+        mutationGate.endReplacement();
+      }
+      return;
+    }
+
+    if (isBlockedByDataReplacement(request, url, mutationGate)) {
+      sendJson(response, 423, {
+        ok: false,
+        error: "Data replacement is in progress. Try again shortly."
+      });
       return;
     }
 
@@ -950,6 +1052,11 @@ export function createEditorServer(options = {}) {
         dataImportManager,
         dataArchiveLimitBytes
       );
+      return;
+    }
+
+    if (url.pathname === "/api/data/recovery/snapshots") {
+      await handleDataRecoverySnapshotsApi(request, response, dataRecoveryManager);
       return;
     }
 
@@ -1045,7 +1152,13 @@ export function createEditorServer(options = {}) {
       sendText(response, 404, "Not found");
     });
   });
-  server.once("close", () => dataImportManager.dispose());
+  server.once("close", () => {
+    try {
+      dataImportManager.dispose();
+    } finally {
+      dataRecoveryManager.dispose();
+    }
+  });
   return server;
 }
 
