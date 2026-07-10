@@ -90,7 +90,7 @@ function snapshotId(basename) {
 test("discovers both snapshot types with newest-first timestamps and registry metadata", (t) => {
   const { dataRoot } = makeDataRoot(t);
   const older = writeSnapshot(dataRoot, "pre-import-20260709-080910");
-  writeSnapshot(dataRoot, "pre-import-20260709-080910-2");
+  const collision = writeSnapshot(dataRoot, "pre-import-20260709-080910-2");
   const newer = writeSnapshot(dataRoot, "pre-restore-20260711-101112");
 
   const snapshots = listDataSnapshots({ dataRoot });
@@ -107,6 +107,7 @@ test("discovers both snapshot types with newest-first timestamps and registry me
   ]);
   assert.equal(snapshots[0].id, snapshotId(newer.basename));
   assert.equal(snapshots[1].id, snapshotId(older.basename));
+  assert.equal(snapshots[2].id, snapshotId(collision.basename));
   assert.match(snapshots[0].id, /^[a-f0-9]{64}$/);
   assert.deepEqual({
     valid: snapshots[0].valid,
@@ -221,6 +222,14 @@ test("returns stable path-free invalid states for registry, YAML, and photo fail
     assert.equal(snapshot.valid, false);
     assert.equal(snapshot.code, "invalid-data");
     assert.equal(snapshot.reason, "Snapshot data is invalid.");
+    assert.deepEqual(Object.keys(snapshot).sort(), [
+      "code",
+      "createdAt",
+      "id",
+      "reason",
+      "type",
+      "valid"
+    ]);
   }
   assert.equal(JSON.stringify(snapshots).includes(parent), false);
 });
@@ -243,8 +252,15 @@ test("hashes allowlisted basenames and returns stable ordering without absolute 
   assert.equal(first.every(({ id }) => /^[a-f0-9]{64}$/.test(id)), true);
   assert.equal(JSON.stringify(first).includes(parent), false);
   for (const snapshot of first) {
-    for (const privateKey of ["candidateRoot", "dataRoot", "stagingRoot"]) {
-      assert.equal(Object.hasOwn(snapshot, privateKey), false);
-    }
+    assert.deepEqual(Object.keys(snapshot).sort(), [
+      "activeResumeId",
+      "activeResumeName",
+      "createdAt",
+      "id",
+      "resumeCount",
+      "resumes",
+      "type",
+      "valid"
+    ]);
   }
 });
