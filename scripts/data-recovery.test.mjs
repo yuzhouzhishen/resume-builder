@@ -458,6 +458,100 @@ test("restore rollback failure preserves every surviving root and reports manual
   assert.equal(manager.isRestoring(), false);
 });
 
+test("restore preserves rollback failure when staging cleanup also fails", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-priority-token`);
+  let renameCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "priority-token",
+    rename(sourceRoot, targetRoot) {
+      renameCalls += 1;
+      if (renameCalls === 1) {
+        renameSync(sourceRoot, targetRoot);
+        return;
+      }
+      if (renameCalls === 2) {
+        throw new Error(`publish failed at ${parent}`);
+      }
+      throw new Error(`rollback failed at ${parent}`);
+    },
+    remove() {
+      throw new Error(`cleanup failed at ${parent}`);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 500);
+  assert.equal(error.code, "restore-rollback-failed");
+  assert.match(error.message, /previous data could not be restored.*manual recovery/i);
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(renameCalls, 3);
+  assert.equal(existsSync(dataRoot), false);
+  assert.equal(existsSync(backupRoot), true);
+  assert.equal(existsSync(stagingRoot), true);
+  assert.equal(existsSync(source.rootDir), true);
+  assert.equal(manager.isRestoring(), false);
+});
+
+test("restore keeps its lock active through injected staging cleanup", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-cleanup-lock-token`);
+  let manager;
+  let selectedId;
+  let removeCalls = 0;
+  let tokenCalls = 0;
+  let restoringDuringRemove;
+  let stagingExistsAfterDispose;
+  let nestedError;
+  manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory() {
+      tokenCalls += 1;
+      if (tokenCalls === 1) {
+        return "cleanup-lock-token";
+      }
+      throw new Error(`nested restore reached token creation at ${parent}`);
+    },
+    copy(sourceRoot, targetRoot, options) {
+      cpSync(sourceRoot, targetRoot, options);
+      throw new Error(`copy failed at ${parent}`);
+    },
+    remove(target, options) {
+      removeCalls += 1;
+      if (removeCalls === 1) {
+        restoringDuringRemove = manager.isRestoring();
+        manager.dispose();
+        stagingExistsAfterDispose = existsSync(target);
+        nestedError = captureError(() => manager.restore(selectedId));
+      }
+      if (existsSync(target)) {
+        rmSync(target, options);
+      }
+    }
+  });
+  selectedId = snapshotId(source.basename);
+
+  const error = captureError(() => manager.restore(selectedId));
+
+  assert.equal(error.code, "restore-copy-failed");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(restoringDuringRemove, true);
+  assert.equal(stagingExistsAfterDispose, true);
+  assert.equal(nestedError.statusCode, 423);
+  assert.equal(nestedError.code, "restore-locked");
+  assert.equal(nestedError.message.includes(parent), false);
+  assert.equal(removeCalls, 1);
+  assert.equal(tokenCalls, 1);
+  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(manager.isRestoring(), false);
+});
+
 test("restore rejects unsafe tokens and never claims an existing staging directory", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");

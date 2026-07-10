@@ -87,7 +87,7 @@ export function createDataRecoveryManager(options) {
     restoring = true;
     ownedStaging = stagingRoot;
 
-    let transactionFailed = false;
+    let primaryError = null;
     let backupRoot;
     try {
       try {
@@ -192,22 +192,25 @@ export function createDataRecoveryManager(options) {
         preRestoreBackup: path.basename(backupRoot)
       };
     } catch (error) {
-      transactionFailed = true;
+      primaryError = error;
       throw error;
     } finally {
-      restoring = false;
-      if (ownedStaging) {
-        try {
-          removeOwnedStaging();
-        } catch {
-          throw createStatusError(
-            transactionFailed
-              ? "Restore failed and temporary staging could not be cleaned up. Manual cleanup is required."
-              : "Temporary restore staging could not be cleaned up.",
-            500,
-            "restore-cleanup-failed"
-          );
+      try {
+        if (ownedStaging) {
+          try {
+            removeOwnedStaging();
+          } catch {
+            if (!primaryError) {
+              throw createStatusError(
+                "Temporary restore staging could not be cleaned up.",
+                500,
+                "restore-cleanup-failed"
+              );
+            }
+          }
         }
+      } finally {
+        restoring = false;
       }
     }
   }
