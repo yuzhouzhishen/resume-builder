@@ -275,4 +275,5 @@ test("package scripts run privacy checks locally and in CI", () => {
   assert.match(packageJson.scripts.test, /^npm run privacy:check && /);
   assert.match(packageJson.scripts.test, /scripts\/ci-workflow\.test\.mjs/);
   assert.match(packageJson.scripts.test, /scripts\/privacy-check\.test\.mjs/);
+  assert.match(packageJson.scripts.test, /--test-timeout=30000/);
 });
