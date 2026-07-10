@@ -1051,14 +1051,15 @@ button:disabled {
 }
 
 .recovery-snapshot-heading {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 52px auto;
   min-width: 0;
   align-items: baseline;
-  justify-content: space-between;
   gap: 12px;
 }
 
 .recovery-snapshot-heading strong,
+.recovery-snapshot-status,
 .recovery-snapshot-heading time,
 .recovery-snapshot-summary {
   min-width: 0;
@@ -1067,6 +1068,18 @@ button:disabled {
 
 .recovery-snapshot-heading strong {
   color: inherit;
+}
+
+.recovery-snapshot-status {
+  width: 52px;
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 650;
+  text-align: center;
+}
+
+.recovery-snapshot-row.is-invalid .recovery-snapshot-status {
+  color: var(--muted);
 }
 
 .recovery-snapshot-heading time,
@@ -1109,8 +1122,12 @@ button:disabled {
   }
 
   .recovery-snapshot-heading {
-    display: grid;
+    grid-template-columns: minmax(0, 1fr) 52px;
     gap: 2px;
+  }
+
+  .recovery-snapshot-heading time {
+    grid-column: 1 / -1;
   }
 }
 

@@ -3888,6 +3888,7 @@ test("editor recovery center shows loading, load errors, retry, and empty histor
   });
   t.after(async () => app.close());
   const page = await openEditorPage(t);
+  const privateLookingPath = ["", "Users", "example", "private"].join("/");
   let snapshotRequests = 0;
   let releaseFirstRequest;
   const firstRequestBlocked = new Promise((resolve) => {
@@ -3950,6 +3951,7 @@ test("editor recovery center lists historical data accessibly and confirms befor
   const page = await openEditorPage(t, { viewport: { width: 1280, height: 800 } });
   let restoreRequests = 0;
   const privateLookingPath = ["", "Users", "example", "private"].join("/");
+  const longResumeName = "一份非常长的活动简历名称，用于验证窄屏幕下能够自然换行而不会撑宽恢复对话框";
   const snapshots = [
     {
       id: "newest-valid",
@@ -3958,9 +3960,9 @@ test("editor recovery center lists historical data accessibly and confirms befor
       valid: true,
       resumeCount: 2,
       activeResumeId: "cpp",
-      activeResumeName: "一份非常长的活动简历名称，用于验证窄屏幕下能够自然换行而不会撑宽恢复对话框",
+      activeResumeName: longResumeName,
       resumes: [
-        { id: "cpp", name: "一份非常长的活动简历名称，用于验证窄屏幕下能够自然换行而不会撑宽恢复对话框" },
+        { id: "cpp", name: longResumeName },
         { id: "safe", name: "<img src=x onerror=window.__recoveryXss=true>" }
       ]
     },
@@ -3973,15 +3975,33 @@ test("editor recovery center lists historical data accessibly and confirms befor
       reason: `Unsafe symlink at ${privateLookingPath}/photo.jpg`
     },
     {
+      id: "invalid-data-middle",
+      type: "pre-restore",
+      createdAt: "2026-07-09T07:08:09+08:00",
+      valid: false,
+      code: "invalid-data",
+      reason: `Invalid registry at ${privateLookingPath}/resumes.json`
+    },
+    {
       id: "oldest-valid",
       type: "pre-import",
-      createdAt: "2026-07-09T06:07:08+08:00",
+      createdAt: "2026-07-08T06:07:08+08:00",
       valid: true,
       resumeCount: 1,
       activeResumeId: "legacy",
       activeResumeName: "旧简历",
       resumes: [{ id: "legacy", name: "旧简历" }]
-    }
+    },
+    ...Array.from({ length: 8 }, (_, index) => ({
+      id: `history-${index + 1}`,
+      type: index % 2 === 0 ? "pre-import" : "pre-restore",
+      createdAt: `2026-07-${String(7 - index).padStart(2, "0")}T05:06:07+08:00`,
+      valid: true,
+      resumeCount: index + 1,
+      activeResumeId: `history-${index + 1}`,
+      activeResumeName: `${longResumeName} ${index + 1}`,
+      resumes: [{ id: `history-${index + 1}`, name: `${longResumeName} ${index + 1}` }]
+    }))
   ];
   await page.route("**/api/data/recovery/snapshots", (route) => route.fulfill({
     status: 200,
@@ -4003,7 +4023,7 @@ test("editor recovery center lists historical data accessibly and confirms befor
   await page.waitForSelector(".recovery-snapshot-row");
 
   const rowTexts = await page.locator(".recovery-snapshot-row").allTextContents();
-  assert.equal(rowTexts.length, 3);
+  assert.equal(rowTexts.length, 12);
   assert.match(rowTexts[0], /恢复前备份/);
   assert.match(rowTexts[0], /2026-07-11 08:09:10/);
   assert.match(rowTexts[0], /2 份简历/);
@@ -4011,14 +4031,23 @@ test("editor recovery center lists historical data accessibly and confirms befor
   assert.match(rowTexts[1], /导入前备份/);
   assert.match(rowTexts[1], /2026-07-10 07:08:09/);
   assert.match(rowTexts[1], /存在不安全文件，无法恢复/);
-  assert.match(rowTexts[2], /导入前备份/);
+  assert.match(rowTexts[2], /恢复前备份/);
+  assert.match(rowTexts[2], /数据文件无效，无法恢复/);
+  assert.match(rowTexts[3], /导入前备份/);
   assert.equal(rowTexts.join(" ").includes(privateLookingPath), false);
-  assert.doesNotMatch(rowTexts.join(" "), /Unsafe symlink|private\/photo/);
+  assert.doesNotMatch(rowTexts.join(" "), /Unsafe symlink|Invalid registry|private\/photo/);
+  assert.deepEqual(await page.locator(".recovery-snapshot-status").allTextContents(), [
+    "可恢复",
+    "不可恢复",
+    "不可恢复",
+    ...Array(9).fill("可恢复")
+  ]);
   assert.equal(await page.evaluate(() => window.__recoveryXss), undefined);
 
   const validRows = page.locator("button.recovery-snapshot-row:not(:disabled)");
-  assert.equal(await validRows.count(), 2);
-  assert.equal(await page.locator(".recovery-snapshot-row.is-invalid").isDisabled(), true);
+  assert.equal(await validRows.count(), 10);
+  assert.equal(await page.locator(".recovery-snapshot-row.is-invalid").count(), 2);
+  assert.equal(await page.locator(".recovery-snapshot-row.is-invalid").first().isDisabled(), true);
   assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), true);
   await page.locator("#dataDialogClose").focus();
   await page.keyboard.press("Tab");
@@ -4031,21 +4060,39 @@ test("editor recovery center lists historical data accessibly and confirms befor
   assert.match(await page.textContent(".recovery-snapshot-detail"), /一份非常长的活动简历名称/);
   assert.match(await page.textContent(".recovery-snapshot-detail"), /<img src=x onerror=window.__recoveryXss=true>/);
 
-  await page.setViewportSize({ width: 390, height: 700 });
-  const overflow = await page.evaluate(() => {
-    const dialog = document.querySelector("#dataDialog");
-    const list = document.querySelector(".recovery-snapshot-list");
-    return {
-      dialogRight: dialog.getBoundingClientRect().right,
-      dialogLeft: dialog.getBoundingClientRect().left,
-      dialogOverflow: dialog.scrollWidth > dialog.clientWidth,
-      listOverflow: list.scrollWidth > list.clientWidth
-    };
-  });
-  assert.ok(overflow.dialogLeft >= 0);
-  assert.ok(overflow.dialogRight <= 390);
-  assert.equal(overflow.dialogOverflow, false);
-  assert.equal(overflow.listOverflow, false);
+  await page.click("#dataDialogClose");
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.waitForSelector(".recovery-snapshot-row");
+  assert.equal(await page.locator(".recovery-snapshot-row.is-selected").count(), 0);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), true);
+  await page.click("[data-snapshot-id='newest-valid']");
+
+  for (const viewport of [
+    { width: 1280, height: 800 },
+    { width: 390, height: 700 }
+  ]) {
+    await page.setViewportSize(viewport);
+    const overflow = await page.evaluate(() => {
+      const dialog = document.querySelector("#dataDialog");
+      const list = document.querySelector(".recovery-snapshot-list");
+      const dialogBox = dialog.getBoundingClientRect();
+      return {
+        dialogRight: dialogBox.right,
+        dialogLeft: dialogBox.left,
+        dialogOverflow: dialog.scrollWidth > dialog.clientWidth,
+        listOverflow: list.scrollWidth > list.clientWidth,
+        listScrolls: list.scrollHeight > list.clientHeight,
+        listOverflowY: getComputedStyle(list).overflowY
+      };
+    });
+    assert.ok(overflow.dialogLeft >= 0);
+    assert.ok(overflow.dialogRight <= viewport.width);
+    assert.equal(overflow.dialogOverflow, false);
+    assert.equal(overflow.listOverflow, false);
+    assert.equal(overflow.listScrolls, true);
+    assert.equal(overflow.listOverflowY, "auto");
+  }
 
   await page.click("#dataDialogPrimary");
   assert.equal(restoreRequests, 0);
@@ -4066,6 +4113,7 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
   t.after(async () => app.close());
   const page = await openEditorPage(t);
   const privateLookingPath = ["", "Users", "example", "private"].join("/");
+  let generateRequests = 0;
   const snapshot = {
     id: "recoverable",
     type: "pre-restore",
@@ -4113,6 +4161,14 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
       })
     });
   });
+  await page.route("**/api/generate", async (route) => {
+    generateRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true })
+    });
+  });
   await page.goto(app.url);
   await page.waitForSelector("[data-path='profile.name']");
   await page.click("#dataManagerButton");
@@ -4138,6 +4194,7 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
   assert.match(successMessage, /resume-data\.pre-restore-20260711-080910/);
   assert.equal(successMessage.includes(privateLookingPath), false);
   assert.doesNotMatch(successMessage, /private/);
+  assert.equal(generateRequests, 0);
   assert.equal(await page.textContent("#resumeSelectLabel"), "恢复后的简历");
   assert.match(await page.textContent("#statusStrip"), /PDF 待生成/);
   assert.equal(await page.locator("#previewFrame").getAttribute("src"), "about:blank");
@@ -4170,4 +4227,65 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
   assert.equal(restoreRequests, 3);
   assert.match(await page.textContent("#messageLine"), /恢复前请先保存或撤销当前修改/);
   assert.equal(await page.evaluate(() => document.activeElement?.id), "saveButton");
+});
+
+test("editor recovery center preserves UI-driven pending import cancellation", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  await page.route("**/api/data/recovery/snapshots", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ ok: true, snapshots: [] })
+  }));
+  await page.route("**/api/data/import/inspect", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({
+      ok: true,
+      token: "pending-token",
+      summary: {
+        createdAt: "2026-07-11T08:09:10+08:00",
+        formatVersion: 1,
+        resumeCount: 1,
+        activeResumeId: "cpp",
+        resumes: [{ id: "cpp", name: "C++ 应届生" }]
+      }
+    })
+  }));
+  await page.route("**/api/data/import/pending-token", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ ok: true })
+  }));
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.waitForFunction(() => document.querySelector("#dataDialogBody")?.textContent?.includes("暂无可恢复的历史数据"));
+  await page.click("#dataDialogCancel");
+
+  await page.click("#dataManagerButton");
+  const chooserPromise = page.waitForEvent("filechooser");
+  await page.click("#importDataButton");
+  const chooser = await chooserPromise;
+  await chooser.setFiles({
+    name: "resume-builder-backup.zip",
+    mimeType: "application/zip",
+    buffer: Buffer.from("synthetic package")
+  });
+  await page.waitForFunction(() => document.querySelector("#dataDialogPrimary")?.textContent === "确认导入");
+  const deleteRequest = page.waitForRequest((request) => (
+    request.method() === "DELETE" && request.url().endsWith("/api/data/import/pending-token")
+  ));
+  await page.click("#dataDialogCancel");
+  await deleteRequest;
+  assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), false);
 });

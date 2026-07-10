@@ -863,6 +863,7 @@ function renderDataDialog() {
               >
                 <span class="recovery-snapshot-heading">
                   <strong>${escapeHtml(recoveryTypeLabel(snapshot.type))}</strong>
+                  <span class="recovery-snapshot-status">${isValid ? "可恢复" : "不可恢复"}</span>
                   <time>${escapeHtml(formatDataPackageDate(snapshot.createdAt))}</time>
                 </span>
                 <span class="recovery-snapshot-summary">${escapeHtml(summary)}</span>
