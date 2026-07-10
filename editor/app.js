@@ -96,6 +96,8 @@ const state = {
   dataDialogError: "",
   selectedDataFile: null,
   pendingImport: null,
+  recoverySnapshots: [],
+  selectedRecoverySnapshotId: "",
   pendingDraftPreviewMessage: "",
   message: "",
   messageKind: ""
@@ -129,6 +131,7 @@ const elements = {
   dataManagerMenu: document.querySelector("#dataManagerMenu"),
   exportData: document.querySelector("#exportDataButton"),
   importData: document.querySelector("#importDataButton"),
+  recoverData: document.querySelector("#recoverDataButton"),
   dataImportInput: document.querySelector("#dataImportInput"),
   currentFile: document.querySelector("#currentFileLabel"),
   dialog: document.querySelector("#resumeDialog"),
@@ -749,6 +752,63 @@ function formatDataPackageDate(value) {
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
+const recoveryInvalidLabels = {
+  "invalid-data": "数据文件无效，无法恢复",
+  "unsafe-tree": "存在不安全文件，无法恢复",
+  "missing-data": "数据不完整，无法恢复"
+};
+
+function recoveryTypeLabel(type) {
+  return type === "pre-import" ? "导入前备份" : "恢复前备份";
+}
+
+function selectedRecoverySnapshot() {
+  return state.recoverySnapshots.find((snapshot) => (
+    snapshot.valid && snapshot.id === state.selectedRecoverySnapshotId
+  )) || null;
+}
+
+function recoveryInvalidLabel(code) {
+  return recoveryInvalidLabels[code] || "数据不可用，无法恢复";
+}
+
+function renderRecoveryDetail(snapshot) {
+  if (!snapshot) {
+    return "";
+  }
+  return `
+    <section class="recovery-snapshot-detail" aria-label="所选历史数据详情">
+      <p><strong>${escapeHtml(recoveryTypeLabel(snapshot.type))}</strong>，包含 ${escapeHtml(snapshot.resumeCount)} 份简历</p>
+      <ul class="data-resume-list">
+        ${(snapshot.resumes || []).map((resume) => `
+          <li><span>${escapeHtml(resume.name)}</span><span>${escapeHtml(resume.id)}</span></li>
+        `).join("")}
+      </ul>
+    </section>
+  `;
+}
+
+function safeRecoveryRequestError(error) {
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("changed")) {
+    return "所选恢复数据已发生变化，请重新读取后再试。";
+  }
+  if (message.includes("not found")) {
+    return "所选恢复数据不存在，请重新读取后再试。";
+  }
+  if (message.includes("not valid") || message.includes("invalid")) {
+    return "所选恢复数据不可用，请选择其他记录。";
+  }
+  if (message.includes("in progress") || message.includes("locked")) {
+    return "当前有其他数据操作正在进行，请稍后重试。";
+  }
+  return "操作未完成，请稍后重试。";
+}
+
+function safeBackupName(value) {
+  return String(value || "").split(/[\\/]/).filter(Boolean).at(-1) || "恢复前备份";
+}
+
 function renderDataDialog() {
   const mode = state.dataDialogMode;
   const file = state.selectedDataFile;
@@ -759,6 +819,73 @@ function renderDataDialog() {
   elements.dataDialogPrimary.disabled = state.dataDialogBusy;
   elements.dataDialogPrimary.hidden = false;
   elements.dataDialog.setAttribute("aria-busy", String(state.dataDialogBusy));
+
+  if (mode.startsWith("recovery-") || mode === "recovering") {
+    const selected = selectedRecoverySnapshot();
+    elements.dataDialogTitle.textContent = "恢复历史数据";
+
+    if (mode === "recovery-loading") {
+      elements.dataDialogBody.innerHTML = "<p class=\"data-dialog-status\">正在读取恢复历史...</p>";
+      elements.dataDialogPrimary.textContent = "读取中";
+      elements.dataDialogPrimary.disabled = true;
+      return;
+    }
+
+    if (mode === "recovery-error") {
+      elements.dataDialogBody.innerHTML = "<p>恢复历史暂时无法读取，当前已保存数据没有发生变化。</p>";
+      elements.dataDialogPrimary.textContent = "重试";
+      return;
+    }
+
+    if (mode === "recovery-list") {
+      if (state.recoverySnapshots.length === 0) {
+        elements.dataDialogBody.innerHTML = "<p class=\"recovery-empty-state\">暂无可恢复的历史数据。</p>";
+        elements.dataDialogPrimary.hidden = true;
+        return;
+      }
+
+      elements.dataDialogBody.innerHTML = `
+        <p>选择一份历史数据查看其中的简历，再继续确认恢复。</p>
+        <div class="recovery-snapshot-list" aria-label="恢复历史数据列表">
+          ${state.recoverySnapshots.map((snapshot) => {
+            const isValid = Boolean(snapshot.valid);
+            const isSelected = isValid && snapshot.id === state.selectedRecoverySnapshotId;
+            const summary = isValid
+              ? `${snapshot.resumeCount} 份简历 · 当前：${snapshot.activeResumeName || snapshot.activeResumeId || "--"}`
+              : recoveryInvalidLabel(snapshot.code);
+            return `
+              <button
+                class="recovery-snapshot-row${isSelected ? " is-selected" : ""}${isValid ? "" : " is-invalid"}"
+                type="button"
+                data-snapshot-id="${attr(snapshot.id)}"
+                aria-pressed="${isSelected}"
+                ${isValid ? "" : "aria-disabled=\"true\" disabled"}
+              >
+                <span class="recovery-snapshot-heading">
+                  <strong>${escapeHtml(recoveryTypeLabel(snapshot.type))}</strong>
+                  <time>${escapeHtml(formatDataPackageDate(snapshot.createdAt))}</time>
+                </span>
+                <span class="recovery-snapshot-summary">${escapeHtml(summary)}</span>
+              </button>
+            `;
+          }).join("")}
+        </div>
+        ${renderRecoveryDetail(selected)}
+      `;
+      elements.dataDialogPrimary.textContent = "继续";
+      elements.dataDialogPrimary.disabled = !selected;
+      return;
+    }
+
+    elements.dataDialogBody.innerHTML = `
+      ${renderRecoveryDetail(selected)}
+      <p class="data-privacy-note">确认后，全部已保存数据（简历、照片、备份和配置）将被所选历史数据替换。当前数据会自动保留为恢复前备份。</p>
+      ${mode === "recovering" ? "<p class=\"data-dialog-status\">正在保留当前数据并恢复...</p>" : ""}
+    `;
+    elements.dataDialogPrimary.textContent = mode === "recovering" ? "正在恢复" : "确认恢复";
+    elements.dataDialogPrimary.disabled = state.dataDialogBusy || !selected;
+    return;
+  }
 
   if (mode === "export") {
     elements.dataDialogTitle.textContent = "导出数据包";
@@ -838,6 +965,8 @@ function closeDataDialog({ cancelPending = true } = {}) {
   const token = cancelPending ? state.pendingImport?.token : "";
   state.pendingImport = null;
   state.selectedDataFile = null;
+  state.recoverySnapshots = [];
+  state.selectedRecoverySnapshotId = "";
   state.dataDialogMode = "";
   state.dataDialogError = "";
   elements.dataImportInput.value = "";
@@ -872,6 +1001,35 @@ function requestDataImport() {
   }
   elements.dataImportInput.value = "";
   elements.dataImportInput.click();
+}
+
+async function requestDataRecovery() {
+  closeResumeMenus();
+  if (state.dirty) {
+    setMessage("恢复前请先保存或撤销当前修改", "warning");
+    elements.save.focus();
+    return;
+  }
+
+  state.recoverySnapshots = [];
+  state.selectedRecoverySnapshotId = "";
+  openDataDialog("recovery-loading");
+  try {
+    const body = await requestJson("/api/data/recovery/snapshots");
+    if (state.dataDialogMode !== "recovery-loading") {
+      return;
+    }
+    state.recoverySnapshots = Array.isArray(body.snapshots) ? body.snapshots : [];
+    state.dataDialogMode = "recovery-list";
+    state.dataDialogError = "";
+  } catch (_error) {
+    if (state.dataDialogMode !== "recovery-loading") {
+      return;
+    }
+    state.dataDialogMode = "recovery-error";
+    state.dataDialogError = "读取恢复历史失败，请稍后重试。";
+  }
+  renderDataDialog();
 }
 
 async function inspectDataImport(file) {
@@ -930,6 +1088,49 @@ async function commitDataImport() {
     state.pendingDraftPreviewMessage = "";
     state.dataDialogMode = "import-ready";
     state.dataDialogError = `导入失败：${error.message}`;
+  } finally {
+    state.dataDialogBusy = false;
+    setBusy("");
+    if (elements.dataDialog.open) {
+      renderDataDialog();
+    }
+  }
+}
+
+async function commitDataRecovery() {
+  const snapshot = selectedRecoverySnapshot();
+  if (state.dirty) {
+    closeDataDialog({ cancelPending: false });
+    setMessage("恢复前请先保存或撤销当前修改", "warning");
+    queueMicrotask(() => elements.save.focus());
+    return;
+  }
+  if (!snapshot || state.dataDialogBusy || isBusy()) {
+    return;
+  }
+
+  state.dataDialogBusy = true;
+  state.dataDialogMode = "recovering";
+  state.dataDialogError = "";
+  renderDataDialog();
+  setBusy("recovering-data");
+  try {
+    const body = await requestJson("/api/data/recovery/restore", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ snapshotId: snapshot.id })
+    });
+    applyRegistry(body);
+    const recoveryMessage = `恢复完成，当前数据已保留到 ${safeBackupName(body.preRestoreBackup)}`;
+    state.pendingDraftPreviewMessage = recoveryMessage;
+    state.dataDialogBusy = false;
+    closeDataDialog({ cancelPending: false });
+    await loadSelectedResume({ draftOnly: true });
+    setMessage(recoveryMessage, "ok");
+  } catch (error) {
+    state.pendingDraftPreviewMessage = "";
+    state.dataDialogMode = "recovery-confirm";
+    state.dataDialogError = `恢复失败：${safeRecoveryRequestError(error)}`;
   } finally {
     state.dataDialogBusy = false;
     setBusy("");
@@ -2015,6 +2216,9 @@ elements.exportData.addEventListener("click", () => {
 });
 
 elements.importData.addEventListener("click", requestDataImport);
+elements.recoverData.addEventListener("click", () => {
+  void requestDataRecovery();
+});
 elements.dataImportInput.addEventListener("change", () => {
   void inspectDataImport(elements.dataImportInput.files[0]);
 });
@@ -2060,7 +2264,38 @@ elements.dataDialogPrimary.addEventListener("click", () => {
   if (state.dataDialogMode === "import-error") {
     closeDataDialog({ cancelPending: false });
     elements.dataImportInput.click();
+    return;
   }
+  if (state.dataDialogMode === "recovery-list" && selectedRecoverySnapshot()) {
+    state.dataDialogMode = "recovery-confirm";
+    state.dataDialogError = "";
+    renderDataDialog();
+    elements.dataDialogPrimary.focus();
+    return;
+  }
+  if (state.dataDialogMode === "recovery-confirm") {
+    void commitDataRecovery();
+    return;
+  }
+  if (state.dataDialogMode === "recovery-error") {
+    void requestDataRecovery();
+  }
+});
+elements.dataDialogBody.addEventListener("click", (event) => {
+  const snapshotButton = event.target.closest("button[data-snapshot-id]");
+  if (!snapshotButton || snapshotButton.disabled || state.dataDialogMode !== "recovery-list") {
+    return;
+  }
+  const snapshot = state.recoverySnapshots.find((entry) => (
+    entry.valid && entry.id === snapshotButton.dataset.snapshotId
+  ));
+  if (!snapshot) {
+    return;
+  }
+  state.selectedRecoverySnapshotId = snapshot.id;
+  state.dataDialogError = "";
+  renderDataDialog();
+  elements.dataDialogBody.querySelector(`[data-snapshot-id="${CSS.escape(snapshot.id)}"]`)?.focus();
 });
 elements.dataDialogCancel.addEventListener("click", () => closeDataDialog());
 elements.dataDialogClose.addEventListener("click", () => closeDataDialog());

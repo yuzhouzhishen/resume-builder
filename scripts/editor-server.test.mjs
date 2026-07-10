@@ -650,6 +650,7 @@ test("editor opens a draft directly when the generated preview is absent", async
   });
   t.after(async () => app.close());
   const page = await openEditorPage(t);
+  const privateLookingPath = ["", "Users", "example", "private"].join("/");
   const generatedPreviewRequests = [];
   const consoleErrors = [];
   page.on("response", (response) => {
@@ -3752,7 +3753,8 @@ test("editor data management menu exports an unencrypted package without changin
   await page.click("#dataManagerButton");
   assert.deepEqual(await page.locator("#dataManagerMenu button").allTextContents(), [
     "导出数据包",
-    "导入数据包"
+    "导入数据包",
+    "恢复历史数据"
   ]);
   await page.click("#exportDataButton");
   assert.match(await page.textContent("#dataDialog"), /包含个人信息/);
@@ -3836,4 +3838,336 @@ test("editor inspects and commits an imported package then reloads the draft pre
   assert.equal(await page.locator("#resumeSelectMenu [data-resume-id='ai-agent']").count(), 1);
   assert.match(await page.textContent("#statusStrip"), /PDF 待生成/);
   assert.match(await page.textContent("#messageLine"), /导入完成/);
+});
+
+test("editor recovery center menu and historical data dirty protection", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  let snapshotRequests = 0;
+  await page.route("**/api/data/recovery/snapshots", async (route) => {
+    snapshotRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, snapshots: [] })
+    });
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+
+  await page.click("#dataManagerButton");
+  assert.deepEqual(await page.locator("#dataManagerMenu button").allTextContents(), [
+    "导出数据包",
+    "导入数据包",
+    "恢复历史数据"
+  ]);
+  await page.fill("[data-path='profile.name']", "未保存姓名");
+  await page.click("#recoverDataButton");
+
+  assert.equal(snapshotRequests, 0);
+  assert.equal(await page.locator("#dataManagerMenu").isHidden(), true);
+  assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), false);
+  assert.match(await page.textContent("#messageLine"), /恢复前请先保存或撤销当前修改/);
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "saveButton");
+});
+
+test("editor recovery center shows loading, load errors, retry, and empty historical data", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  let snapshotRequests = 0;
+  let releaseFirstRequest;
+  const firstRequestBlocked = new Promise((resolve) => {
+    releaseFirstRequest = resolve;
+  });
+  await page.route("**/api/data/recovery/snapshots", async (route) => {
+    snapshotRequests += 1;
+    if (snapshotRequests === 1) {
+      await firstRequestBlocked;
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: false, error: `private failure at ${privateLookingPath}/data` })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, snapshots: [] })
+    });
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  assert.equal(await page.textContent("#dataDialogTitle"), "恢复历史数据");
+  assert.match(await page.textContent("#dataDialogBody"), /正在读取恢复历史/);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), true);
+  assert.equal(await page.locator("#dataDialogCancel").isDisabled(), false);
+  assert.equal(await page.locator("#dataDialogClose").isDisabled(), false);
+
+  releaseFirstRequest();
+  await page.waitForFunction(() => document.querySelector("#dataDialogPrimary")?.textContent === "重试");
+  const failedDialogText = await page.textContent("#dataDialog");
+  assert.match(failedDialogText, /读取恢复历史失败/);
+  assert.equal(failedDialogText.includes(privateLookingPath), false);
+  assert.doesNotMatch(failedDialogText, /private failure/);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), false);
+
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialogBody")?.textContent?.includes("暂无可恢复的历史数据"));
+  assert.equal(snapshotRequests, 2);
+  assert.equal(await page.locator("#dataDialogPrimary").isHidden(), true);
+  assert.equal(await page.locator("#dataDialogCancel").isDisabled(), false);
+  await page.click("#dataDialogCancel");
+  assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), false);
+});
+
+test("editor recovery center lists historical data accessibly and confirms before restore", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t, { viewport: { width: 1280, height: 800 } });
+  let restoreRequests = 0;
+  const privateLookingPath = ["", "Users", "example", "private"].join("/");
+  const snapshots = [
+    {
+      id: "newest-valid",
+      type: "pre-restore",
+      createdAt: "2026-07-11T08:09:10+08:00",
+      valid: true,
+      resumeCount: 2,
+      activeResumeId: "cpp",
+      activeResumeName: "一份非常长的活动简历名称，用于验证窄屏幕下能够自然换行而不会撑宽恢复对话框",
+      resumes: [
+        { id: "cpp", name: "一份非常长的活动简历名称，用于验证窄屏幕下能够自然换行而不会撑宽恢复对话框" },
+        { id: "safe", name: "<img src=x onerror=window.__recoveryXss=true>" }
+      ]
+    },
+    {
+      id: "invalid-middle",
+      type: "pre-import",
+      createdAt: "2026-07-10T07:08:09+08:00",
+      valid: false,
+      code: "unsafe-tree",
+      reason: `Unsafe symlink at ${privateLookingPath}/photo.jpg`
+    },
+    {
+      id: "oldest-valid",
+      type: "pre-import",
+      createdAt: "2026-07-09T06:07:08+08:00",
+      valid: true,
+      resumeCount: 1,
+      activeResumeId: "legacy",
+      activeResumeName: "旧简历",
+      resumes: [{ id: "legacy", name: "旧简历" }]
+    }
+  ];
+  await page.route("**/api/data/recovery/snapshots", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ ok: true, snapshots })
+  }));
+  await page.route("**/api/data/recovery/restore", async (route) => {
+    restoreRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true })
+    });
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.waitForSelector(".recovery-snapshot-row");
+
+  const rowTexts = await page.locator(".recovery-snapshot-row").allTextContents();
+  assert.equal(rowTexts.length, 3);
+  assert.match(rowTexts[0], /恢复前备份/);
+  assert.match(rowTexts[0], /2026-07-11 08:09:10/);
+  assert.match(rowTexts[0], /2 份简历/);
+  assert.match(rowTexts[0], /当前：一份非常长的活动简历名称/);
+  assert.match(rowTexts[1], /导入前备份/);
+  assert.match(rowTexts[1], /2026-07-10 07:08:09/);
+  assert.match(rowTexts[1], /存在不安全文件，无法恢复/);
+  assert.match(rowTexts[2], /导入前备份/);
+  assert.equal(rowTexts.join(" ").includes(privateLookingPath), false);
+  assert.doesNotMatch(rowTexts.join(" "), /Unsafe symlink|private\/photo/);
+  assert.equal(await page.evaluate(() => window.__recoveryXss), undefined);
+
+  const validRows = page.locator("button.recovery-snapshot-row:not(:disabled)");
+  assert.equal(await validRows.count(), 2);
+  assert.equal(await page.locator(".recovery-snapshot-row.is-invalid").isDisabled(), true);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), true);
+  await page.locator("#dataDialogClose").focus();
+  await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.snapshotId), "newest-valid");
+  assert.notEqual(await validRows.first().evaluate((button) => getComputedStyle(button).outlineWidth), "0px");
+  await validRows.first().click();
+  assert.equal(await validRows.first().getAttribute("aria-pressed"), "true");
+  assert.equal(await validRows.first().evaluate((button) => button.classList.contains("is-selected")), true);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), false);
+  assert.match(await page.textContent(".recovery-snapshot-detail"), /一份非常长的活动简历名称/);
+  assert.match(await page.textContent(".recovery-snapshot-detail"), /<img src=x onerror=window.__recoveryXss=true>/);
+
+  await page.setViewportSize({ width: 390, height: 700 });
+  const overflow = await page.evaluate(() => {
+    const dialog = document.querySelector("#dataDialog");
+    const list = document.querySelector(".recovery-snapshot-list");
+    return {
+      dialogRight: dialog.getBoundingClientRect().right,
+      dialogLeft: dialog.getBoundingClientRect().left,
+      dialogOverflow: dialog.scrollWidth > dialog.clientWidth,
+      listOverflow: list.scrollWidth > list.clientWidth
+    };
+  });
+  assert.ok(overflow.dialogLeft >= 0);
+  assert.ok(overflow.dialogRight <= 390);
+  assert.equal(overflow.dialogOverflow, false);
+  assert.equal(overflow.listOverflow, false);
+
+  await page.click("#dataDialogPrimary");
+  assert.equal(restoreRequests, 0);
+  assert.match(await page.textContent("#dataDialogBody"), /全部已保存数据/);
+  assert.match(await page.textContent("#dataDialogBody"), /简历、照片、备份和配置/);
+  assert.match(await page.textContent("#dataDialogBody"), /当前数据会自动保留/);
+  assert.equal(await page.textContent("#dataDialogPrimary"), "确认恢复");
+});
+
+test("editor historical data restore is single-flight, reloads drafts, and keeps confirmation on failure", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const privateLookingPath = ["", "Users", "example", "private"].join("/");
+  const snapshot = {
+    id: "recoverable",
+    type: "pre-restore",
+    createdAt: "2026-07-11T08:09:10+08:00",
+    valid: true,
+    resumeCount: 1,
+    activeResumeId: "cpp",
+    activeResumeName: "C++ 应届生",
+    resumes: [{ id: "cpp", name: "C++ 应届生" }]
+  };
+  let restoreRequests = 0;
+  let releaseRestore;
+  const restoreBlocked = new Promise((resolve) => {
+    releaseRestore = resolve;
+  });
+  await page.route("**/api/data/recovery/snapshots", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ ok: true, snapshots: [snapshot] })
+  }));
+  await page.route("**/api/data/recovery/restore", async (route) => {
+    restoreRequests += 1;
+    if (restoreRequests === 1) {
+      await restoreBlocked;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          activeId: "cpp",
+          resumes: [{ id: "cpp", name: "恢复后的简历", file: "resumes/cpp.yaml" }],
+          preRestoreBackup: `${privateLookingPath}/resume-data.pre-restore-20260711-080910`,
+          generation: "needs generate"
+        })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: false,
+        code: "restore-source-changed",
+        error: `The selected snapshot changed at ${privateLookingPath}/data.`
+      })
+    });
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.click("[data-snapshot-id='recoverable']");
+  await page.click("#dataDialogPrimary");
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialog")?.getAttribute("aria-busy") === "true");
+  await page.locator("#dataDialogPrimary").evaluate((button) => {
+    button.click();
+    button.click();
+  });
+
+  assert.equal(restoreRequests, 1);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), true);
+  assert.equal(await page.locator("#dataDialogCancel").isDisabled(), true);
+  assert.equal(await page.locator("#dataDialogClose").isDisabled(), true);
+  releaseRestore();
+  await page.waitForFunction(() => !document.querySelector("#dataDialog")?.open);
+  await page.waitForFunction(() => document.querySelector("#messageLine")?.textContent?.includes("恢复完成"));
+
+  const successMessage = await page.textContent("#messageLine");
+  assert.match(successMessage, /resume-data\.pre-restore-20260711-080910/);
+  assert.equal(successMessage.includes(privateLookingPath), false);
+  assert.doesNotMatch(successMessage, /private/);
+  assert.equal(await page.textContent("#resumeSelectLabel"), "恢复后的简历");
+  assert.match(await page.textContent("#statusStrip"), /PDF 待生成/);
+  assert.equal(await page.locator("#previewFrame").getAttribute("src"), "about:blank");
+
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.click("[data-snapshot-id='recoverable']");
+  await page.click("#dataDialogPrimary");
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("恢复失败"));
+  const failureText = await page.textContent("#dataDialog");
+  assert.equal(restoreRequests, 2);
+  assert.equal(await page.textContent("#dataDialogPrimary"), "确认恢复");
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), false);
+  assert.match(failureText, /所选恢复数据已发生变化/);
+  assert.match(failureText, /C\+\+ 应届生/);
+  assert.equal(failureText.includes(privateLookingPath), false);
+  assert.doesNotMatch(failureText, /The selected|private\/data/);
+
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("恢复失败"));
+  assert.equal(restoreRequests, 3);
+
+  await page.evaluate(() => {
+    const input = document.querySelector("[data-path='profile.name']");
+    input.value = "恢复前又发生修改";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.click("#dataDialogPrimary");
+  assert.equal(restoreRequests, 3);
+  assert.match(await page.textContent("#messageLine"), /恢复前请先保存或撤销当前修改/);
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "saveButton");
 });
