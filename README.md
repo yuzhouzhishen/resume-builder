@@ -43,6 +43,9 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 ## 当前文档
 
+- [V2.2 CI 与隐私边界](docs/v2-2-boundaries.md)
+- [V2.2 CI 与隐私设计](docs/plans/2026-07-10-v2-2-ci-privacy-design.md)
+- [V2.2 CI 与隐私实施计划](docs/plans/2026-07-10-v2-2-ci-privacy.md)
 - [V2.1B 当前边界](docs/v2-1b-boundaries.md)
 - [V2.1B 验收清单](docs/v2-1b-acceptance-checklist.md)
 - [V2.1B 导入导出设计](docs/plans/2026-07-10-v2-1-backup-import-export-design.md)
@@ -248,6 +251,20 @@ projects: []
 - `examples/ai-agent.yaml`
 
 在左侧 `+` 菜单使用 `从样例新建` 会创建一份新简历，不覆盖当前内容。网页底部的 `载入样例` 仍用于覆盖当前选中简历，覆盖前会写入该 ID 的备份目录。
+
+## 开发与提交安全
+
+提交或推送代码前运行：
+
+```bash
+npm run ci
+```
+
+该命令会先检查当前 Git 索引和完整历史中的隐私风险，再运行全部测试。GitHub Actions 会在每次 push 和 pull request 上执行同一个入口。
+
+真实简历 YAML、注册表、照片、备份、生成文件、数据导出 ZIP、`.env.local` 和本机绝对路径不得进入代码仓库。真实数据应始终保存在 `RESUME_BUILDER_DATA_DIR` 指向的仓库外目录。
+
+隐私扫描是提交错误的检测层，不是加密工具，也不能撤回已经推送到远端的内容。发现误提交时应立即停止推送并清理 Git 历史。
 
 ## 常见问题
 

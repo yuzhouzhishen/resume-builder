@@ -9,7 +9,9 @@
   "scripts": {
     "generate": "node scripts/generate.mjs",
     "editor": "node scripts/editor-server.mjs",
-    "test": "node --test scripts/app-paths.test.mjs scripts/data-root.test.mjs scripts/resume-registry.test.mjs scripts/data-package.test.mjs && node --test --test-concurrency=1 --test-timeout=10000 scripts/editor-server.test.mjs && node --test scripts/render.test.mjs"
+    "privacy:check": "node scripts/privacy-check.mjs",
+    "test": "npm run privacy:check && node --test scripts/app-paths.test.mjs scripts/ci-workflow.test.mjs scripts/data-root.test.mjs scripts/resume-registry.test.mjs scripts/data-package.test.mjs scripts/privacy-check.test.mjs && node --test --test-concurrency=1 --test-timeout=10000 scripts/editor-server.test.mjs && node --test scripts/render.test.mjs",
+    "ci": "npm test"
   },
   "dependencies": {
     "fflate": "^0.8.3",
