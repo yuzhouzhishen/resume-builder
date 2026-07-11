@@ -354,8 +354,7 @@ function warnIfPreviewNeedsRegeneration() {
   return true;
 }
 
-function measurePreviewContent(documentInFrame) {
-  const resume = documentInFrame.querySelector("#resume-page");
+function measurePreviewContent(resume) {
   const pageRect = resume.getBoundingClientRect();
   const contentRect = Array.from(resume.querySelectorAll("*")).reduce((acc, element) => {
     const rect = element.getBoundingClientRect();
@@ -405,13 +404,44 @@ function previewLayoutCandidates(payload) {
 
 function applyLayoutCandidate(documentInFrame, candidate) {
   const rootStyle = documentInFrame.documentElement.style;
+  applyLayoutCandidateVariables(rootStyle, candidate);
+  documentInFrame.body.dataset.layoutMode = candidate.mode;
+}
+
+function applyLayoutCandidateVariables(style, candidate) {
   for (const name of allowedLayoutCssVariables) {
-    rootStyle.removeProperty(name);
+    style.removeProperty(name);
   }
   for (const [name, value] of Object.entries(candidate.cssVariables)) {
-    rootStyle.setProperty(name, value);
+    style.setProperty(name, value);
   }
-  documentInFrame.body.dataset.layoutMode = candidate.mode;
+}
+
+function createLayoutMeasurementPage(documentInFrame) {
+  const visiblePage = documentInFrame.querySelector("#resume-page");
+  if (!visiblePage || !documentInFrame.body) {
+    return null;
+  }
+
+  const host = documentInFrame.createElement("div");
+  host.dataset.layoutMeasurementHost = "true";
+  Object.assign(host.style, {
+    position: "absolute",
+    left: "-100000px",
+    top: "0",
+    width: "210mm",
+    visibility: "hidden",
+    pointerEvents: "none",
+    fontSize: "var(--body-size)",
+    lineHeight: "var(--body-line-height)"
+  });
+
+  const page = visiblePage.cloneNode(true);
+  page.removeAttribute("id");
+  page.dataset.layoutMeasurementPage = "true";
+  host.append(page);
+  documentInFrame.body.append(host);
+  return { host, page };
 }
 
 async function selectDraftLayout() {
@@ -420,25 +450,37 @@ async function selectDraftLayout() {
     return null;
   }
 
-  let lastResult = null;
-  for (const candidate of state.layoutCandidates) {
-    applyLayoutCandidate(documentInFrame, candidate);
-    await nextPreviewFrame(documentInFrame);
-    const metrics = measurePreviewContent(documentInFrame);
-    const verticalOverflow = Math.max(0, metrics.height - metrics.pageHeight);
-    const horizontalOverflow = Math.max(0, metrics.width - metrics.pageWidth);
-    const overflow = {
-      vertical: verticalOverflow,
-      horizontal: horizontalOverflow,
-      total: Math.max(verticalOverflow, horizontalOverflow)
-    };
-    lastResult = { candidate, metrics, overflow };
-    if (overflow.total <= fitTolerancePx) {
-      return lastResult;
-    }
+  const measurement = createLayoutMeasurementPage(documentInFrame);
+  if (!measurement) {
+    return null;
   }
 
-  return lastResult;
+  let selected = null;
+  try {
+    for (const candidate of state.layoutCandidates) {
+      applyLayoutCandidateVariables(measurement.host.style, candidate);
+      await nextPreviewFrame(documentInFrame);
+      const metrics = measurePreviewContent(measurement.page);
+      const verticalOverflow = Math.max(0, metrics.height - metrics.pageHeight);
+      const horizontalOverflow = Math.max(0, metrics.width - metrics.pageWidth);
+      const overflow = {
+        vertical: verticalOverflow,
+        horizontal: horizontalOverflow,
+        total: Math.max(verticalOverflow, horizontalOverflow)
+      };
+      selected = { candidate, metrics, overflow };
+      if (overflow.total <= fitTolerancePx) {
+        break;
+      }
+    }
+  } finally {
+    measurement.host.remove();
+  }
+
+  if (selected) {
+    applyLayoutCandidate(documentInFrame, selected.candidate);
+  }
+  return selected;
 }
 
 function scheduleDraftPreview(delay = draftPreviewDelayMs) {
