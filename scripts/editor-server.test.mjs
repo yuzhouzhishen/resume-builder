@@ -4436,6 +4436,64 @@ test("editor recovery center maps unavailable and transient restore codes to saf
   assert.equal(restoreRequests, 3);
 });
 
+test("editor recovery center blocks retry when restore requires manual recovery", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const privateLookingPath = ["", "Users", "example", "private"].join("/");
+  const snapshot = {
+    id: "manual-recovery-snapshot",
+    type: "pre-restore",
+    createdAt: "2026-07-11T08:09:10+08:00",
+    valid: true,
+    resumeCount: 1,
+    activeResumeId: "cpp",
+    activeResumeName: "人工恢复测试简历",
+    resumes: [{ id: "cpp", name: "人工恢复测试简历" }]
+  };
+  let restoreRequests = 0;
+  await page.route("**/api/data/recovery/snapshots", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ ok: true, snapshots: [snapshot] })
+  }));
+  await page.route("**/api/data/recovery/restore", async (route) => {
+    restoreRequests += 1;
+    await route.fulfill({
+      status: 500,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: false,
+        code: "restore-rollback-failed",
+        error: `Manual recovery detail at ${privateLookingPath}/snapshot.`
+      })
+    });
+  });
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.click("[data-snapshot-id='manual-recovery-snapshot']");
+  await page.click("#dataDialogPrimary");
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("需要人工处理"));
+
+  const dialogText = await page.textContent("#dataDialog");
+  assert.equal(restoreRequests, 1);
+  assert.match(dialogText, /无法自动回滚/);
+  assert.match(dialogText, /停止继续恢复/);
+  assert.match(dialogText, /人工恢复测试简历/);
+  assert.equal(dialogText.includes(privateLookingPath), false);
+  assert.doesNotMatch(dialogText, /Manual recovery detail/);
+  assert.equal(await page.locator("#dataDialogPrimary").isHidden(), true);
+  assert.equal(await page.locator("#dataDialogClose").isDisabled(), false);
+  await page.waitForFunction(() => document.activeElement?.id === "dataDialogClose");
+  await page.locator("#dataDialogPrimary").evaluate((button) => button.click());
+  assert.equal(restoreRequests, 1);
+});
+
 test("editor recovery center retries only UI refresh after a committed restore", async (t) => {
   const rootDir = makeApiFixture();
   const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });

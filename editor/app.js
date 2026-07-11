@@ -796,7 +796,9 @@ const recoveryRestoreErrorMessages = {
   "restore-source-changed": "所选恢复数据已发生变化，已重新读取恢复历史。",
   "restore-staging-copy-mismatch": "所选恢复数据已发生变化，已重新读取恢复历史。",
   "restore-staging-invalid": "所选恢复数据不可用，已重新读取恢复历史。",
-  "restore-locked": "当前编辑器中已有数据恢复正在进行，请稍后重试。"
+  "restore-locked": "当前编辑器中已有数据恢复正在进行，请稍后重试。",
+  "restore-rollback-failed": "恢复无法自动回滚，需要人工处理。请停止继续恢复，并检查数据目录中的现有数据和备份。",
+  "restore-quarantine-failed": "恢复后的异常数据无法隔离，需要人工处理。请停止继续恢复，并检查数据目录中的现有数据和备份。"
 };
 
 const unavailableRecoveryCodes = new Set([
@@ -805,6 +807,11 @@ const unavailableRecoveryCodes = new Set([
   "restore-source-changed",
   "restore-staging-copy-mismatch",
   "restore-staging-invalid"
+]);
+
+const manualRecoveryCodes = new Set([
+  "restore-rollback-failed",
+  "restore-quarantine-failed"
 ]);
 
 function renderRecoveryDetail(snapshot) {
@@ -827,6 +834,7 @@ function recoveryRestoreError(error) {
   const code = String(error?.code || "");
   return {
     unavailable: unavailableRecoveryCodes.has(code),
+    manual: manualRecoveryCodes.has(code),
     message: recoveryRestoreErrorMessages[code] || "恢复操作未完成，请稍后重试。"
   };
 }
@@ -879,6 +887,15 @@ function renderDataDialog() {
       `;
       elements.dataDialogPrimary.textContent = "刷新中";
       elements.dataDialogPrimary.disabled = true;
+      return;
+    }
+
+    if (mode === "recovery-manual") {
+      elements.dataDialogBody.innerHTML = `
+        ${renderRecoveryDetail(selected)}
+        <p>程序不会继续提交恢复。请先检查数据目录旁保留的当前数据、备份和失败目录。</p>
+      `;
+      elements.dataDialogPrimary.hidden = true;
       return;
     }
 
@@ -1234,6 +1251,13 @@ async function commitDataRecovery() {
     state.pendingDraftPreviewMessage = "";
     const recoveryError = recoveryRestoreError(error);
     clearDataRecoveryBusy();
+    if (recoveryError.manual) {
+      state.dataDialogMode = "recovery-manual";
+      state.dataDialogError = `恢复失败：${recoveryError.message}`;
+      renderDataDialog();
+      queueMicrotask(() => elements.dataDialogClose.focus());
+      return;
+    }
     if (recoveryError.unavailable) {
       state.selectedRecoverySnapshotId = "";
       await requestDataRecovery({ notice: `恢复失败：${recoveryError.message}` });
