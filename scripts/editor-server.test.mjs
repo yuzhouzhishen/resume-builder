@@ -4327,7 +4327,7 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
   assert.equal(restoreRequests, 2);
   assert.equal(await page.textContent("#dataDialogPrimary"), "确认恢复");
   assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), false);
-  assert.match(failureText, /其他数据恢复正在进行/);
+  assert.match(failureText, /当前编辑器中已有数据恢复正在进行/);
   assert.match(failureText, /C\+\+ 应届生/);
   assert.equal(failureText.includes(privateLookingPath), false);
   assert.doesNotMatch(failureText, /Misleading transient|private\/data/);
@@ -4425,14 +4425,14 @@ test("editor recovery center maps unavailable and transient restore codes to saf
   await page.click("[data-snapshot-id='coded-error-snapshot']");
   await page.click("#dataDialogPrimary");
   await page.click("#dataDialogPrimary");
-  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("其他数据恢复正在进行"));
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("当前编辑器中已有数据恢复正在进行"));
   const transientText = await page.textContent("#dataDialog");
   assert.equal(restoreRequests, 2);
   assert.equal(transientText.includes(privateLookingPath), false);
   assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), false);
   assert.equal(await page.locator(".recovery-snapshot-detail").count(), 1);
   await page.click("#dataDialogPrimary");
-  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("其他数据恢复正在进行"));
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("当前编辑器中已有数据恢复正在进行"));
   assert.equal(restoreRequests, 3);
 });
 
