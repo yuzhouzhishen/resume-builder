@@ -276,6 +276,29 @@ test("GitHub synthetic pull request merge refs are excluded from repository hist
   assert.equal(result.stats.commitCount, 3);
 });
 
+test("GitHub pull request merge checkout excludes synthetic HEAD metadata", () => {
+  const root = makeRepository();
+  writeFileSync(path.join(root, "README.md"), "base fixture\n");
+  commitAll(root, "Base fixture");
+
+  git(root, "checkout", "-b", "feature");
+  writeFileSync(path.join(root, "feature.txt"), "feature fixture\n");
+  commitAll(root, "Feature fixture");
+  git(root, "checkout", "main");
+  writeFileSync(path.join(root, "main.txt"), "main fixture\n");
+  commitAll(root, "Main fixture");
+  git(root, "config", "user.email", ["person", "mail.example"].join("@"));
+  git(root, "merge", "--no-ff", "feature", "-m", "Synthetic pull request merge");
+  const syntheticMerge = git(root, "rev-parse", "HEAD");
+  git(root, "update-ref", "refs/pull/1/merge", syntheticMerge);
+  git(root, "checkout", "--detach", syntheticMerge);
+  git(root, "branch", "-f", "main", `${syntheticMerge}^1`);
+
+  const result = scanRepository(root, { githubRef: "refs/pull/1/merge" });
+
+  assert.equal(result.violations.some(({ rule }) => rule === "commit-email"), false);
+});
+
 test("extensionless binary and oversized text blobs are rejected", () => {
   const root = makeRepository();
   const binary = Buffer.from([1, 2, 3, 4]);
@@ -300,5 +323,5 @@ test("package scripts run privacy checks locally and in CI", () => {
   assert.match(packageJson.scripts.test, /^npm run privacy:check && /);
   assert.match(packageJson.scripts.test, /scripts\/ci-workflow\.test\.mjs/);
   assert.match(packageJson.scripts.test, /scripts\/privacy-check\.test\.mjs/);
-  assert.match(packageJson.scripts.test, /--test-timeout=30000/);
+  assert.match(packageJson.scripts.test, /--test-timeout=60000/);
 });

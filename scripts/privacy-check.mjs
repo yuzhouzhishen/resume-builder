@@ -22,6 +22,7 @@ const ALLOWED_EMAILS = new Set(["noreply@github.com"]);
 const MAX_TEXT_BLOB_BYTES = 2 * 1024 * 1024;
 const BLOB_BATCH_SIZE = 32;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const GITHUB_PULL_REQUEST_MERGE_REF_PATTERN = /^refs\/pull\/\d+\/merge$/;
 const HISTORY_REVISION_ARGS = [
   "--exclude=refs/pull/*/merge",
   "--exclude=refs/remotes/pr/*/merge",
@@ -208,7 +209,18 @@ function readHistoryPaths(root) {
   return output.split("\0").filter(Boolean);
 }
 
-function readCommitViolations(root) {
+function readSyntheticPullRequestHead(root, githubRef) {
+  if (!GITHUB_PULL_REQUEST_MERGE_REF_PATTERN.test(githubRef || "")) {
+    return null;
+  }
+  const [commit, ...parents] = git(root, ["rev-list", "--parents", "-n", "1", "HEAD"])
+    .trim()
+    .split(" ");
+  return parents.length === 2 ? commit : null;
+}
+
+function readCommitViolations(root, githubRef) {
+  const syntheticPullRequestHead = readSyntheticPullRequestHead(root, githubRef);
   const output = git(root, [
     "log",
     "--format=%H%x00%ae%x00%ce",
@@ -218,6 +230,9 @@ function readCommitViolations(root) {
 
   for (const line of output.split("\n").filter(Boolean)) {
     const [commit, authorEmail, committerEmail] = line.split("\0");
+    if (commit === syntheticPullRequestHead) {
+      continue;
+    }
     for (const [role, email] of [["author", authorEmail], ["committer", committerEmail]]) {
       if (email && !isAllowedEmail(email)) {
         violations.push({
@@ -312,7 +327,10 @@ function deduplicateViolations(violations) {
   });
 }
 
-export function scanRepository(root = process.cwd()) {
+export function scanRepository(
+  root = process.cwd(),
+  { githubRef = process.env.GITHUB_REF } = {}
+) {
   const repositoryRoot = path.resolve(root);
   const trackedEntries = readTrackedEntries(repositoryRoot);
   const trackedPaths = trackedEntries.map(({ filePath }) => filePath);
@@ -321,7 +339,7 @@ export function scanRepository(root = process.cwd()) {
   const violations = [
     ...withScope(findPathViolations(trackedPaths), "current"),
     ...withScope(findPathViolations(historyPaths), "history"),
-    ...readCommitViolations(repositoryRoot)
+    ...readCommitViolations(repositoryRoot, githubRef)
   ];
 
   const objectSources = new Map();
