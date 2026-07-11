@@ -44,6 +44,7 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 ## 当前文档
 
 - [V2.4 有限排版控制设计](docs/plans/2026-07-11-v2-4-layout-controls-design.md)
+- [V2.4 有限排版控制实施计划](docs/plans/2026-07-11-v2-4-layout-controls.md)
 - [V2.3 数据恢复边界](docs/v2-3-boundaries.md)
 - [V2.3 验收清单](docs/v2-3-acceptance-checklist.md)
 - [V2.3 数据恢复设计](docs/plans/2026-07-11-v2-3-data-recovery-design.md)
