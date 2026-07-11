@@ -1052,6 +1052,24 @@ function requestDataImport() {
   elements.dataImportInput.click();
 }
 
+function focusRecoveryListControl(generation) {
+  queueMicrotask(() => {
+    if (generation !== state.recoveryLoadGeneration
+      || state.dataDialogMode !== "recovery-list"
+      || state.dataDialogBusy
+      || !elements.dataDialog.open) {
+      return;
+    }
+    const firstValidSnapshot = elements.dataDialogBody.querySelector(
+      "button.recovery-snapshot-row:not(:disabled)"
+    );
+    const target = firstValidSnapshot || (!elements.dataDialogClose.disabled
+      ? elements.dataDialogClose
+      : null);
+    target?.focus();
+  });
+}
+
 async function requestDataRecovery({ notice = "" } = {}) {
   closeResumeMenus();
   if (state.dirty) {
@@ -1085,6 +1103,9 @@ async function requestDataRecovery({ notice = "" } = {}) {
     state.dataDialogError = "读取恢复历史失败，请稍后重试。";
   }
   renderDataDialog();
+  if (state.dataDialogMode === "recovery-list") {
+    focusRecoveryListControl(generation);
+  }
 }
 
 async function inspectDataImport(file) {

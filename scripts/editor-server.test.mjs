@@ -4336,6 +4336,8 @@ test("editor recovery center maps unavailable and transient restore codes to saf
   await page.waitForSelector("[data-path='profile.name']");
   await page.click("#dataManagerButton");
   await page.click("#recoverDataButton");
+  await page.waitForFunction(() => document.activeElement?.dataset.snapshotId === "coded-error-snapshot");
+  assert.equal(await page.locator(".recovery-snapshot-row.is-selected").count(), 0);
   await page.click("[data-snapshot-id='coded-error-snapshot']");
   await page.click("#dataDialogPrimary");
   await page.click("#dataDialogPrimary");
@@ -4349,6 +4351,22 @@ test("editor recovery center maps unavailable and transient restore codes to saf
   assert.doesNotMatch(unavailableText, /Wrong English message/);
   assert.equal(await page.locator(".recovery-snapshot-row.is-selected").count(), 0);
   assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), true);
+  const relistFocus = await page.evaluate(() => {
+    const dialog = document.querySelector("#dataDialog");
+    const active = document.activeElement;
+    return {
+      dialogOpen: dialog.open,
+      insideDialog: dialog.contains(active),
+      enabled: !active.disabled,
+      tagName: active.tagName,
+      snapshotId: active.dataset.snapshotId || ""
+    };
+  });
+  assert.equal(relistFocus.dialogOpen, true);
+  assert.equal(relistFocus.insideDialog, true);
+  assert.equal(relistFocus.enabled, true);
+  assert.notEqual(relistFocus.tagName, "BODY");
+  assert.equal(relistFocus.snapshotId, "coded-error-snapshot");
 
   await page.click("[data-snapshot-id='coded-error-snapshot']");
   await page.click("#dataDialogPrimary");
