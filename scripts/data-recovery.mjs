@@ -47,6 +47,7 @@ export function createDataRecoveryManager(options) {
   const verifyClaimedLock = options.verifyClaimedLock || readLockOwner;
   const validate = options.validate || validateDataRoot;
   const isProcessAlive = options.isProcessAlive || processIsAlive;
+  const pathLstat = options.pathLstat || lstatSync;
   let restoring = false;
   let ownedStaging = null;
   let ownedLock = null;
@@ -112,9 +113,18 @@ export function createDataRecoveryManager(options) {
           "restore-token-failed"
         );
       }
-      stagingRoot = findAvailablePath(
-        path.join(parentDir, `.${dataBasename}.restore-${token}`)
-      );
+      try {
+        stagingRoot = findAvailablePath(
+          path.join(parentDir, `.${dataBasename}.restore-${token}`),
+          pathLstat
+        );
+      } catch {
+        throw createStatusError(
+          "A restore staging location could not be reserved.",
+          500,
+          "restore-staging-reservation-failed"
+        );
+      }
 
       try {
         mkdir(stagingRoot, { recursive: false, mode: 0o700 });
@@ -219,7 +229,8 @@ export function createDataRecoveryManager(options) {
 
       try {
         backupRoot = findAvailablePath(
-          `${dataRoot}.pre-restore-${formatTimestamp(now())}`
+          `${dataRoot}.pre-restore-${formatTimestamp(now())}`,
+          pathLstat
         );
       } catch {
         throw createStatusError(
@@ -296,8 +307,11 @@ export function createDataRecoveryManager(options) {
           throw new Error("Published restore ownership changed");
         }
       } catch {
-        const quarantineRoot = findAvailablePath(`${dataRoot}.failed-restore-${token}`);
         try {
+          const quarantineRoot = findAvailablePath(
+            `${dataRoot}.failed-restore-${token}`,
+            pathLstat
+          );
           rename(dataRoot, quarantineRoot);
         } catch {
           throw createStatusError(
@@ -327,8 +341,11 @@ export function createDataRecoveryManager(options) {
       try {
         registry = validate(dataRoot);
       } catch {
-        const quarantineRoot = findAvailablePath(`${dataRoot}.failed-restore-${token}`);
         try {
+          const quarantineRoot = findAvailablePath(
+            `${dataRoot}.failed-restore-${token}`,
+            pathLstat
+          );
           rename(dataRoot, quarantineRoot);
         } catch {
           throw createStatusError(
@@ -695,19 +712,19 @@ function formatTimestamp(date) {
   return `${iso.slice(0, 10).replaceAll("-", "")}-${iso.slice(11, 19).replaceAll(":", "")}`;
 }
 
-function findAvailablePath(basePath) {
+function findAvailablePath(basePath, inspectPath = lstatSync) {
   let candidatePath = basePath;
   let suffix = 2;
-  while (pathIsOccupied(candidatePath)) {
+  while (pathIsOccupied(candidatePath, inspectPath)) {
     candidatePath = `${basePath}-${suffix}`;
     suffix += 1;
   }
   return candidatePath;
 }
 
-function pathIsOccupied(candidatePath) {
+function pathIsOccupied(candidatePath, inspectPath = lstatSync) {
   try {
-    lstatSync(candidatePath);
+    inspectPath(candidatePath);
     return true;
   } catch (error) {
     if (error.code === "ENOENT") {

@@ -107,6 +107,12 @@ function captureError(action) {
   return captured;
 }
 
+function createPathError(code, target) {
+  const error = new Error(`${code}: path allocation failed at ${target}`);
+  error.code = code;
+  return error;
+}
+
 test("restores a snapshot through a staged transaction without consuming its source", (t) => {
   const { dataRoot } = makeDataRoot(t);
   writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
@@ -191,6 +197,38 @@ test("treats a dangling pre-restore backup path as occupied", (t) => {
   assert.equal(readlinkSync(reservedBackup), missingTarget);
   assert.equal(existsSync(missingTarget), false);
   assert.equal(existsSync(`${reservedBackup}-2`), true);
+});
+
+test("sanitizes non-ENOENT pre-restore backup allocation failures", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-backup-eacces-token`);
+  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
+  const inspectedPaths = [];
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "backup-eacces-token",
+    pathLstat(target) {
+      inspectedPaths.push(target);
+      if (target === backupRoot) {
+        throw createPathError("EACCES", target);
+      }
+      return lstatSync(target);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 500);
+  assert.equal(error.code, "restore-backup-reservation-failed");
+  assert.equal(error.message, "A pre-restore backup location could not be reserved.");
+  assert.equal(error.message.includes(parent), false);
+  assert.deepEqual(inspectedPaths, [stagingRoot, backupRoot]);
+  assert.equal(existsSync(stagingRoot), true);
+  assert.equal(existsSync(backupRoot), false);
+  assert.equal(existsSync(dataRoot), true);
+  assert.equal(existsSync(source.rootDir), true);
 });
 
 test("recovery lock blocks another manager before restore path selection", (t) => {
@@ -850,6 +888,49 @@ test("restore quarantines beside a dangling path without changing the symlink", 
   assert.equal(existsSync(source.rootDir), true);
 });
 
+test("restore preserves final-validation context when quarantine allocation fails", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
+  const quarantineRoot = `${dataRoot}.failed-restore-quarantine-eio-token`;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "quarantine-eio-token",
+    pathLstat(target) {
+      if (target === quarantineRoot) {
+        throw createPathError("EIO", target);
+      }
+      return lstatSync(target);
+    },
+    validate(rootDir) {
+      if (rootDir === dataRoot) {
+        throw new Error(`final validation failed at ${parent}`);
+      }
+      return validateDataRoot(rootDir);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 500);
+  assert.equal(error.code, "restore-quarantine-failed");
+  assert.match(error.message, /final validation.*could not be quarantined.*manual recovery/i);
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>selected-source</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(backupRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(existsSync(quarantineRoot), false);
+  assert.equal(existsSync(source.rootDir), true);
+});
+
 test("restore preserves current and backup copies when quarantine rename fails", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
@@ -1212,6 +1293,29 @@ test("restore allocates beside a dangling staging symlink without changing it", 
   assert.equal(readlinkSync(stagingRoot), missingTarget);
   assert.equal(existsSync(missingTarget), false);
   assert.equal(existsSync(nextStagingRoot), false);
+  assert.equal(existsSync(source.rootDir), true);
+});
+
+test("restore sanitizes non-ENOENT staging allocation failures", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-staging-eacces-token`);
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "staging-eacces-token",
+    pathLstat(target) {
+      throw createPathError("EACCES", target);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 500);
+  assert.equal(error.code, "restore-staging-reservation-failed");
+  assert.equal(error.message, "A restore staging location could not be reserved.");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(existsSync(dataRoot), true);
   assert.equal(existsSync(source.rootDir), true);
 });
 
