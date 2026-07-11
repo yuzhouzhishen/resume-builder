@@ -1180,6 +1180,122 @@ test("editor previews section reordering without saving yaml", async (t) => {
   assert.equal(readFileSync(resumePath, "utf8"), resumeBefore);
 });
 
+test("editor exposes bounded layout settings and previews changed values", async (t) => {
+  const rootDir = makeApiFixture();
+  const originalProfile = structuredClone(validResume.profile);
+  const previewBodies = [];
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+
+  const page = await openEditorPage(t);
+  page.on("request", (request) => {
+    if (request.method() === "POST" && request.url().includes("/api/preview")) {
+      previewBodies.push(request.postDataJSON());
+    }
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-area='layout']");
+
+  assert.deepEqual(
+    await page.locator("[data-area]").evaluateAll((buttons) => buttons.map((button) => button.textContent.trim())),
+    ["内容编辑", "排版设置"]
+  );
+  await page.click("[data-area='layout']");
+
+  assert.match(await page.textContent("#editorForm"), /适配方式/);
+  assert.match(await page.textContent("#editorForm"), /正文字号/);
+  assert.match(await page.textContent("#editorForm"), /行高/);
+  assert.match(await page.textContent("#editorForm"), /内容间距/);
+  assert.match(await page.textContent("#editorForm"), /页边距/);
+  assert.match(await page.textContent("#editorForm"), /模块顺序/);
+  assert.equal(await page.getAttribute("[data-action='set-layout-mode'][data-layout-value='auto']", "aria-pressed"), "true");
+  assert.equal(await page.inputValue("input[data-layout-field='fontSizePt']"), "10.8");
+  assert.equal(await page.inputValue("input[data-layout-field='lineHeight']"), "1.38");
+  assert.equal(await page.inputValue("input[data-layout-field='spacingLevel']"), "67");
+  assert.equal(await page.getAttribute("[data-action='set-layout-margin'][data-layout-value='normal']", "aria-pressed"), "true");
+  assert.equal(await page.locator("[data-action='step-layout'][data-layout-field='fontSizePt'][data-direction='-1']").getAttribute("aria-label"), "减小正文字号");
+  assert.equal(await page.locator("[data-action='step-layout'][data-layout-field='fontSizePt'][data-direction='1']").getAttribute("aria-label"), "增大正文字号");
+
+  await page.click("[data-action='set-layout-mode'][data-layout-value='fixed']");
+  await page.locator("input[data-layout-field='fontSizePt']").fill("11.2");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("未保存"));
+  assert.equal(await page.locator("[data-action='step-layout'][data-layout-field='fontSizePt'][data-direction='1']").isDisabled(), true);
+
+  await page.locator("input[data-layout-field='fontSizePt']").focus();
+  await page.keyboard.press("ArrowLeft");
+  await page.waitForFunction(() => document.querySelector("input[data-layout-field='fontSizePt']")?.value === "11.1");
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset?.layoutField), "fontSizePt");
+
+  await page.waitForTimeout(400);
+  assert.ok(previewBodies.some((body) => (
+    body.resume.layout.mode === "fixed"
+      && body.resume.layout.fontSizePt === 11.1
+  )));
+
+  await page.click("[data-action='reset-layout']");
+  assert.equal(await page.inputValue("input[data-layout-field='fontSizePt']"), "10.8");
+  assert.equal(await page.inputValue("input[data-layout-field='lineHeight']"), "1.38");
+  assert.equal(await page.inputValue("input[data-layout-field='spacingLevel']"), "67");
+  assert.equal(await page.getAttribute("[data-action='set-layout-mode'][data-layout-value='auto']", "aria-pressed"), "true");
+  await page.click("[data-area='content']");
+  assert.equal(await page.inputValue("[data-path='profile.name']"), originalProfile.name);
+  assert.equal(await page.inputValue("[data-path='profile.target']"), originalProfile.target);
+  assert.deepEqual(loadResumeYaml(resumeYamlPath(rootDir)).profile, originalProfile);
+});
+
+test("layout settings stay independent across resumes and survive duplication", async (t) => {
+  const rootDir = makeMultiResumeFixture();
+  const cppPath = resumeYamlPath(rootDir, "cpp");
+  const aiPath = resumeYamlPath(rootDir, "ai-agent");
+  const cppResume = loadResumeYaml(cppPath);
+  cppResume.layout = {
+    mode: "fixed",
+    fontSizePt: 10.4,
+    lineHeight: 1.29,
+    spacingLevel: 35,
+    marginPreset: "narrow"
+  };
+  const aiResume = loadResumeYaml(aiPath);
+  aiResume.layout = {
+    mode: "auto",
+    fontSizePt: 11.1,
+    lineHeight: 1.4,
+    spacingLevel: 80,
+    marginPreset: "wide"
+  };
+  saveResumeYaml(cppPath, cppResume);
+  saveResumeYaml(aiPath, aiResume);
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await waitForResumeOption(page, "ai-agent");
+  await page.click("[data-area='layout']");
+  assert.equal(await page.inputValue("input[data-layout-field='fontSizePt']"), "10.4");
+
+  await selectResumeOption(page, "ai-agent");
+  await page.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "AI Candidate");
+  await page.click("[data-area='layout']");
+  await page.waitForFunction(() => document.querySelector("input[data-layout-field='fontSizePt']")?.value === "11.1");
+  assert.equal(await page.getAttribute("[data-action='set-layout-margin'][data-layout-value='wide']", "aria-pressed"), "true");
+
+  await page.click("#addResumeButton");
+  await page.click("[data-resume-action='duplicate']");
+  await page.fill("#resumeDialogInput", "AI Layout Copy");
+  await page.click("[data-dialog-action='confirm-duplicate']");
+  await waitForResumeOption(page, "ai-layout-copy");
+  await page.click("[data-area='layout']");
+  assert.equal(await page.inputValue("input[data-layout-field='fontSizePt']"), "11.1");
+  assert.equal(await page.inputValue("input[data-layout-field='spacingLevel']"), "80");
+  assert.equal(await page.getAttribute("[data-action='set-layout-margin'][data-layout-value='wide']", "aria-pressed"), "true");
+});
+
 test("editor explains backend version mismatch when an API endpoint is missing", async (t) => {
   const app = await startCustomEditorServer(async (_request, response, url) => {
     if (url.pathname === "/api/resume") {

@@ -1,6 +1,6 @@
 const areas = [
   ["content", "内容编辑"],
-  ["layout", "排版顺序"]
+  ["layout", "排版设置"]
 ];
 
 const contentModules = [
@@ -56,6 +56,18 @@ const fieldLabels = {
 };
 
 const defaultOrder = ["internships", "skills", "projects"];
+const defaultLayoutSettings = Object.freeze({
+  mode: "auto",
+  fontSizePt: 10.8,
+  lineHeight: 1.38,
+  spacingLevel: 67,
+  marginPreset: "normal"
+});
+const layoutNumberFields = Object.freeze({
+  fontSizePt: Object.freeze({ label: "正文字号", min: 10.2, max: 11.2, step: 0.1, unit: "pt", precision: 1 }),
+  lineHeight: Object.freeze({ label: "行高", min: 1.25, max: 1.42, step: 0.01, unit: "", precision: 2 }),
+  spacingLevel: Object.freeze({ label: "内容间距", min: 0, max: 100, step: 1, unit: "", precision: 0 })
+});
 const draftPreviewDelayMs = 300;
 const draftDensityNames = ["normal", "compact", "tight"];
 const fitTolerancePx = 2;
@@ -86,6 +98,9 @@ const state = {
   saveState: "loading",
   busyAction: "",
   density: "--",
+  layoutCandidates: [],
+  effectiveLayout: null,
+  layoutOverflow: null,
   selectedPreviewSection: "",
   selectedPreviewPath: "",
   previewSource: "generated",
@@ -177,6 +192,9 @@ function attr(value) {
 function ensureLayout(resume) {
   resume.layout ||= {};
   resume.layout.sectionOrder ||= [...defaultOrder];
+  for (const [key, value] of Object.entries(defaultLayoutSettings)) {
+    resume.layout[key] ??= value;
+  }
   return resume;
 }
 
@@ -1617,20 +1635,85 @@ function renderBullets(key, parentIndex, items) {
   `;
 }
 
-function renderLayout() {
-  const order = state.resume.layout.sectionOrder || defaultOrder;
+function layoutNumberValue(field, value) {
+  const config = layoutNumberFields[field];
+  return Number(value).toFixed(config.precision);
+}
+
+function renderLayoutNumberControl(field) {
+  const config = layoutNumberFields[field];
+  const value = Number(state.resume.layout[field]);
+  const displayValue = `${layoutNumberValue(field, value)}${config.unit}`;
+  const decreaseDisabled = value <= config.min ? " disabled" : "";
+  const increaseDisabled = value >= config.max ? " disabled" : "";
   return `
-    <section class="form-section">
-      <div class="section-heading"><h2>排版顺序</h2></div>
-      ${order.map((section, index) => `
-        <div class="layout-row">
-          <strong>${escapeHtml(sectionLabels[section])}</strong>
-          <div class="row-actions">
-            <button class="row-action-button" type="button" data-action="move-layout" data-index="${index}" data-direction="-1" title="上移"><span aria-hidden="true">↑</span><span>上移</span></button>
-            <button class="row-action-button" type="button" data-action="move-layout" data-index="${index}" data-direction="1" title="下移"><span aria-hidden="true">↓</span><span>下移</span></button>
-          </div>
+    <div class="layout-control" data-layout-control="${attr(field)}">
+      <div class="layout-control-heading">
+        <label for="layout-${attr(field)}">${escapeHtml(config.label)}</label>
+        <output for="layout-${attr(field)}" data-layout-output="${attr(field)}">${escapeHtml(displayValue)}</output>
+      </div>
+      <div class="layout-control-inputs">
+        <button class="layout-step-button" type="button" data-action="step-layout" data-layout-field="${attr(field)}" data-direction="-1" aria-label="减小${escapeHtml(config.label)}"${decreaseDisabled}>−</button>
+        <input id="layout-${attr(field)}" type="range" data-layout-field="${attr(field)}" min="${config.min}" max="${config.max}" step="${config.step}" value="${attr(layoutNumberValue(field, value))}" aria-valuetext="${attr(displayValue)}">
+        <button class="layout-step-button" type="button" data-action="step-layout" data-layout-field="${attr(field)}" data-direction="1" aria-label="增大${escapeHtml(config.label)}"${increaseDisabled}>+</button>
+      </div>
+      ${field === "spacingLevel" ? `
+        <div class="spacing-anchors" aria-hidden="true">
+          <span>紧凑</span><span>较紧</span><span>标准</span><span>宽松</span>
         </div>
-      `).join("")}
+      ` : ""}
+    </div>
+  `;
+}
+
+function renderLayout() {
+  const layout = state.resume.layout;
+  const order = layout.sectionOrder || defaultOrder;
+  return `
+    <section class="form-section layout-settings-section">
+      <div class="section-heading">
+        <h2>排版设置</h2>
+        <button class="ghost-button" type="button" data-action="reset-layout">恢复默认</button>
+      </div>
+      <div class="layout-setting-group">
+        <div class="layout-setting-label">适配方式</div>
+        <div class="layout-segmented" role="group" aria-label="适配方式">
+          <button type="button" data-action="set-layout-mode" data-layout-value="auto" aria-pressed="${layout.mode === "auto"}">自动适配</button>
+          <button type="button" data-action="set-layout-mode" data-layout-value="fixed" aria-pressed="${layout.mode === "fixed"}">固定参数</button>
+        </div>
+      </div>
+      <div class="layout-control-list">
+        ${renderLayoutNumberControl("fontSizePt")}
+        ${renderLayoutNumberControl("lineHeight")}
+        ${renderLayoutNumberControl("spacingLevel")}
+      </div>
+      <div class="layout-setting-group">
+        <div class="layout-setting-label">页边距</div>
+        <div class="layout-segmented layout-margin-options" role="group" aria-label="页边距">
+          ${[
+            ["narrow", "窄"],
+            ["normal", "标准"],
+            ["wide", "宽"]
+          ].map(([value, label]) => `
+            <button type="button" data-action="set-layout-margin" data-layout-value="${value}" aria-pressed="${layout.marginPreset === value}">${label}</button>
+          `).join("")}
+        </div>
+      </div>
+      <div class="layout-order-section">
+        <div class="layout-order-heading">
+          <h3>模块顺序</h3>
+          <span>控制简历正文的排列</span>
+        </div>
+        ${order.map((section, index) => `
+          <div class="layout-row">
+            <strong>${escapeHtml(sectionLabels[section])}</strong>
+            <div class="row-actions">
+              <button class="row-action-button" type="button" data-action="move-layout" data-index="${index}" data-direction="-1" title="上移"><span aria-hidden="true">↑</span><span>上移</span></button>
+              <button class="row-action-button" type="button" data-action="move-layout" data-index="${index}" data-direction="1" title="下移"><span aria-hidden="true">↓</span><span>下移</span></button>
+            </div>
+          </div>
+        `).join("")}
+      </div>
     </section>
   `;
 }
@@ -1792,6 +1875,50 @@ function newExperience(key) {
   return entry;
 }
 
+function focusLayoutControl(selector) {
+  elements.form.querySelector(selector)?.focus();
+}
+
+function commitLayoutChange(focusSelector) {
+  markDirty();
+  renderForm();
+  focusLayoutControl(focusSelector);
+}
+
+function setLayoutSetting(field, value, focusSelector) {
+  if (state.resume.layout[field] === value) {
+    return false;
+  }
+  state.resume.layout[field] = value;
+  commitLayoutChange(focusSelector);
+  return true;
+}
+
+function normalizedLayoutNumber(field, rawValue) {
+  const config = layoutNumberFields[field];
+  const value = Number(rawValue);
+  const clamped = Math.min(config.max, Math.max(config.min, value));
+  return Number(clamped.toFixed(config.precision));
+}
+
+function setLayoutNumber(field, rawValue, focusSelector) {
+  if (!layoutNumberFields[field]) {
+    return false;
+  }
+  return setLayoutSetting(field, normalizedLayoutNumber(field, rawValue), focusSelector);
+}
+
+function resetLayoutSettings() {
+  const changed = Object.entries(defaultLayoutSettings).some(([field, value]) => (
+    state.resume.layout[field] !== value
+  ));
+  if (!changed) {
+    return;
+  }
+  Object.assign(state.resume.layout, defaultLayoutSettings);
+  commitLayoutChange("[data-action='reset-layout']");
+}
+
 function handleAction(button) {
   const action = button.dataset.action;
   const kind = button.dataset.kind || action.replace(/^delete-/, "");
@@ -1799,6 +1926,43 @@ function handleAction(button) {
   const index = Number(button.dataset.index);
   const itemIndex = button.dataset.itemIndex === "" ? NaN : Number(button.dataset.itemIndex);
   const direction = Number(button.dataset.direction);
+
+  if (action === "set-layout-mode") {
+    setLayoutSetting(
+      "mode",
+      button.dataset.layoutValue,
+      `[data-action="set-layout-mode"][data-layout-value="${button.dataset.layoutValue}"]`
+    );
+    return;
+  }
+
+  if (action === "set-layout-margin") {
+    setLayoutSetting(
+      "marginPreset",
+      button.dataset.layoutValue,
+      `[data-action="set-layout-margin"][data-layout-value="${button.dataset.layoutValue}"]`
+    );
+    return;
+  }
+
+  if (action === "step-layout") {
+    const field = button.dataset.layoutField;
+    const config = layoutNumberFields[field];
+    if (!config) {
+      return;
+    }
+    setLayoutNumber(
+      field,
+      Number(state.resume.layout[field]) + (direction * config.step),
+      `[data-action="step-layout"][data-layout-field="${field}"][data-direction="${direction}"]`
+    );
+    return;
+  }
+
+  if (action === "reset-layout") {
+    resetLayoutSettings();
+    return;
+  }
 
   if (action === "add-experience") {
     state.pendingDelete = null;
@@ -1907,6 +2071,9 @@ function resetResumeEditorState() {
   state.saveState = "loading";
   state.generation = "needs generate";
   state.density = "--";
+  state.layoutCandidates = [];
+  state.effectiveLayout = null;
+  state.layoutOverflow = null;
   state.selectedPreviewSection = "";
   state.selectedPreviewPath = "";
   state.previewSource = "generated";
@@ -2027,7 +2194,7 @@ async function duplicateCurrentResume() {
   const current = activeResumeEntry();
   const result = await showResumeDialog({
     title: "复制当前简历",
-    description: "复制内容和排版顺序，不复制备份和已生成文件。",
+    description: "复制内容和排版设置，不复制备份和已生成文件。",
     input: { value: `${current?.name || "简历"} 副本` },
     validatedActions: ["confirm-duplicate"],
     actions: [
@@ -2487,6 +2654,13 @@ elements.tabs.addEventListener("click", (event) => {
 });
 
 elements.form.addEventListener("input", (event) => {
+  const layoutControl = event.target.closest("input[data-layout-field]");
+  if (layoutControl) {
+    const field = layoutControl.dataset.layoutField;
+    setLayoutNumber(field, layoutControl.value, `input[data-layout-field="${field}"]`);
+    return;
+  }
+
   const control = event.target.closest("[data-path]");
   if (!control || control.readOnly) {
     return;

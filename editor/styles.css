@@ -876,6 +876,177 @@ button:disabled {
   background: var(--surface);
 }
 
+.layout-settings-section {
+  gap: 16px;
+}
+
+.layout-setting-group,
+.layout-control-list,
+.layout-order-section {
+  display: grid;
+  gap: 9px;
+}
+
+.layout-setting-label,
+.layout-control-heading label,
+.layout-order-heading h3 {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.layout-segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.layout-segmented button {
+  min-width: 0;
+  min-height: 32px;
+  border: 0;
+  border-radius: 5px;
+  padding: 0 9px;
+  color: var(--muted);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.layout-segmented button:hover {
+  color: var(--accent);
+  background: rgb(32 87 214 / 6%);
+}
+
+.layout-segmented button[aria-pressed="true"] {
+  color: var(--accent-dark);
+  background: #fff;
+  box-shadow: 0 1px 4px rgb(19 30 47 / 10%);
+}
+
+.layout-margin-options {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.layout-control-list {
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.layout-control {
+  display: grid;
+  gap: 9px;
+  padding: 12px 0;
+}
+
+.layout-control + .layout-control {
+  border-top: 1px solid var(--line);
+}
+
+.layout-control-heading,
+.layout-order-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.layout-control-heading output {
+  min-width: 56px;
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  text-align: right;
+}
+
+.layout-control-inputs {
+  display: grid;
+  grid-template-columns: 32px minmax(120px, 1fr) 32px;
+  align-items: center;
+  gap: 9px;
+}
+
+.layout-step-button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 0;
+  color: var(--text);
+  background: #fff;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.layout-step-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.layout-step-button:disabled {
+  cursor: not-allowed;
+  color: var(--muted-soft);
+  border-color: var(--line);
+  background: var(--surface);
+  opacity: 0.58;
+}
+
+.layout-control input[type="range"] {
+  width: 100%;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.layout-control input[type="range"]:focus-visible,
+.layout-step-button:focus-visible,
+.layout-segmented button:focus-visible {
+  outline: 2px solid rgb(32 87 214 / 24%);
+  outline-offset: 2px;
+}
+
+.spacing-anchors {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: -3px 40px 0;
+  color: var(--muted-soft);
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.spacing-anchors span:first-child {
+  text-align: left;
+}
+
+.spacing-anchors span:last-child {
+  text-align: right;
+}
+
+.layout-order-section {
+  padding-top: 4px;
+}
+
+.layout-order-heading {
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+}
+
+.layout-order-heading h3 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+.layout-order-heading span {
+  color: var(--muted-soft);
+  font-size: 10px;
+}
+
 .layout-row {
   justify-content: space-between;
   border: 1px solid var(--line);
