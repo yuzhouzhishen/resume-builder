@@ -96,15 +96,22 @@ function makeGenerationFixture() {
   return { projectRoot, dataRoot };
 }
 
-function makeGenerationHarness() {
+function makeGenerationHarness(options = {}) {
   const styleTags = [];
+  const appliedVariables = [];
+  const metrics = options.metrics || [];
+  let metricIndex = 0;
+  let newPageCalls = 0;
   const page = {
     async setContent() {},
     async addStyleTag(options) {
       styleTags.push(options);
     },
-    async evaluate() {
-      return {
+    async evaluate(_callback, variables) {
+      if (variables) {
+        appliedVariables.push(variables);
+      }
+      const result = metrics[Math.min(metricIndex, metrics.length - 1)] || {
         height: 900,
         width: 760,
         pageHeight: 1123,
@@ -112,6 +119,8 @@ function makeGenerationHarness() {
         viewportHeight: 1123,
         viewportWidth: 794
       };
+      metricIndex += 1;
+      return result;
     },
     async pdf(options) {
       writeFileSync(options.path, "%PDF-test");
@@ -120,6 +129,7 @@ function makeGenerationHarness() {
   };
   const browser = {
     async newPage() {
+      newPageCalls += 1;
       return page;
     },
     async close() {}
@@ -127,9 +137,16 @@ function makeGenerationHarness() {
 
   return {
     styleTags,
+    appliedVariables,
+    get newPageCalls() {
+      return newPageCalls;
+    },
     launchBrowser: async () => browser,
     verifyPdf() {},
     renderPngFile(_pdfPath, outputPrefix) {
+      if (options.renderPngError) {
+        throw options.renderPngError;
+      }
       writeFileSync(`${outputPrefix}.png`, "png-test");
     }
   };
@@ -532,6 +549,82 @@ test("generateResume uses the active resume and writes isolated outputs", async 
   assert.equal(existsSync(path.join(projectRoot, "output")), false);
   assert.ok(existsSync(result.outputPaths.pdf));
   assert.ok(existsSync(result.outputPaths.png));
+  assert.equal(harness.newPageCalls, 1);
+  assert.deepEqual(result.layout, {
+    mode: "auto",
+    fontSizePt: 10.8,
+    lineHeight: 1.38,
+    spacingLevel: 67,
+    marginPreset: "normal",
+    cssVariables: harness.appliedVariables[0]
+  });
+  assert.deepEqual(result.overflow, { vertical: 0, horizontal: 0, total: 0 });
+});
+
+test("generateResume reuses one page and selects the first fitting auto candidate", async () => {
+  const { projectRoot, dataRoot } = makeGenerationFixture();
+  const harness = makeGenerationHarness({
+    metrics: [
+      { height: 1140, width: 760, pageHeight: 1123, pageWidth: 794 },
+      { height: 1110, width: 760, pageHeight: 1123, pageWidth: 794 }
+    ]
+  });
+
+  const result = await generateResume({ projectRoot, dataRoot, ...harness });
+
+  assert.equal(harness.newPageCalls, 1);
+  assert.equal(harness.appliedVariables.length, 2);
+  assert.equal(result.layout.spacingLevel < 67, true);
+  assert.equal(result.metrics.height, 1110);
+});
+
+test("generateResume fixed mode measures once and reports exact overflow", async () => {
+  const { projectRoot, dataRoot } = makeGenerationFixture();
+  const yamlPath = path.join(dataRoot, "resumes", "cpp.yaml");
+  const data = loadResumeYaml(yamlPath);
+  data.layout = {
+    sectionOrder: ["skills", "internships", "projects"],
+    mode: "fixed",
+    fontSizePt: 11.2,
+    lineHeight: 1.42,
+    spacingLevel: 100,
+    marginPreset: "wide"
+  };
+  saveResumeYaml(yamlPath, data);
+  const harness = makeGenerationHarness({
+    metrics: [{ height: 1161, width: 800, pageHeight: 1123, pageWidth: 794 }]
+  });
+
+  await assert.rejects(
+    () => generateResume({ projectRoot, dataRoot, ...harness }),
+    /Fixed layout does not fit one A4 page[\s\S]*Overflow: 38px/
+  );
+  assert.equal(harness.newPageCalls, 1);
+  assert.equal(harness.appliedVariables.length, 1);
+});
+
+test("generation failures before publication preserve previous outputs", async () => {
+  const { projectRoot, dataRoot } = makeGenerationFixture();
+  const outputDir = path.join(dataRoot, "output", "cpp");
+  mkdirSync(outputDir, { recursive: true });
+  const previous = {
+    preview: "old-preview",
+    pdf: "old-pdf",
+    png: "old-png"
+  };
+  writeFileSync(path.join(outputDir, "preview.html"), previous.preview);
+  writeFileSync(path.join(outputDir, "resume.pdf"), previous.pdf);
+  writeFileSync(path.join(outputDir, "resume.png"), previous.png);
+
+  await assert.rejects(() => generateResume({
+    projectRoot,
+    dataRoot,
+    ...makeGenerationHarness({ renderPngError: new Error("png failed") })
+  }), /png failed/);
+
+  assert.equal(readFileSync(path.join(outputDir, "preview.html"), "utf8"), previous.preview);
+  assert.equal(readFileSync(path.join(outputDir, "resume.pdf"), "utf8"), previous.pdf);
+  assert.equal(readFileSync(path.join(outputDir, "resume.png"), "utf8"), previous.png);
 });
 
 test("generateResume accepts an explicit registered resume id", async () => {

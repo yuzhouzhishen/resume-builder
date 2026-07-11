@@ -1,16 +1,29 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync
+} from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { chromium } from "playwright";
 
-import { compatibilityDensity } from "./layout-settings.mjs";
+import {
+  buildLayoutCandidates,
+  compatibilityDensity,
+  publicLayoutCandidate
+} from "./layout-settings.mjs";
 import {
   DEFAULT_SECTION_ORDER,
   SECTION_TITLES,
   loadResumeYaml,
+  resolveResumeLayout,
   resolveResumeAssetPath,
   validateResume
 } from "./resume-data.mjs";
@@ -32,42 +45,6 @@ const DEFAULT_CSS_FILE = path.join(PROJECT_ROOT, "templates", "resume.css");
 const A4_WIDTH_PX = 794;
 const A4_HEIGHT_PX = 1123;
 const FIT_TOLERANCE_PX = 2;
-
-const DENSITY_PROFILES = [
-  {
-    name: "normal",
-    vars: {
-      "--body-size": "10.8pt",
-      "--body-line-height": "1.38",
-      "--item-gap": "3px",
-      "--section-gap": "8px",
-      "--experience-gap": "5px",
-      "--bullet-indent": "16px"
-    }
-  },
-  {
-    name: "compact",
-    vars: {
-      "--body-size": "10.5pt",
-      "--body-line-height": "1.32",
-      "--item-gap": "2px",
-      "--section-gap": "6px",
-      "--experience-gap": "4px",
-      "--bullet-indent": "15px"
-    }
-  },
-  {
-    name: "tight",
-    vars: {
-      "--body-size": "10.2pt",
-      "--body-line-height": "1.25",
-      "--item-gap": "1px",
-      "--section-gap": "4px",
-      "--experience-gap": "3px",
-      "--bullet-indent": "14px"
-    }
-  }
-];
 
 export function escapeHtml(value) {
   return String(value ?? "")
@@ -263,73 +240,77 @@ function densityStyle(profile) {
     .join(" ");
 }
 
-async function measureHtml(browser, html, profile, cssFile) {
+async function selectLayoutCandidate(browser, data, photoSrc, options) {
+  const candidates = buildLayoutCandidates(resolveResumeLayout(data));
+  const preferred = candidates[0];
   const page = await browser.newPage({
     viewport: { width: A4_WIDTH_PX, height: A4_HEIGHT_PX },
     deviceScaleFactor: 1
   });
 
+  const html = renderResumeHtml(data, {
+    layoutCandidate: preferred,
+    templateFile: options.templateFile,
+    assetPrefix: pathToFileURL(`${options.dataRoot}/`).href,
+    photoSrc
+  });
   await page.setContent(html, {
     waitUntil: "networkidle"
   });
-  await page.addStyleTag({ path: cssFile });
-  await page.addStyleTag({ content: `:root { ${densityStyle(profile)} }` });
-
-  const metrics = await page.evaluate(() => {
-    const resume = document.querySelector("#resume-page");
-    const pageRect = resume.getBoundingClientRect();
-    const descendants = Array.from(resume.querySelectorAll("*"));
-    const contentRect = descendants.reduce((acc, element) => {
-      const rect = element.getBoundingClientRect();
-      return {
-        bottom: Math.max(acc.bottom, rect.bottom - pageRect.top),
-        right: Math.max(acc.right, rect.right - pageRect.left)
-      };
-    }, { bottom: 0, right: 0 });
-    return {
-      height: Math.ceil(contentRect.bottom),
-      width: Math.ceil(contentRect.right),
-      pageHeight: Math.ceil(pageRect.height),
-      pageWidth: Math.ceil(pageRect.width),
-      viewportHeight: window.innerHeight,
-      viewportWidth: window.innerWidth
-    };
-  });
-
-  return { page, metrics };
-}
-
-async function selectDensity(browser, data, photoSrc, options) {
+  await page.addStyleTag({ path: options.cssFile });
   let lastResult = null;
-
-  for (const profile of DENSITY_PROFILES) {
-    const html = renderResumeHtml(data, {
-      density: profile.name,
-      templateFile: options.templateFile,
-      assetPrefix: pathToFileURL(`${options.dataRoot}/`).href,
-      photoSrc
-    });
-    const result = await measureHtml(browser, html, profile, options.cssFile);
-    const verticalOverflow = Math.max(0, result.metrics.height - A4_HEIGHT_PX);
-    const horizontalOverflow = Math.max(0, result.metrics.width - A4_WIDTH_PX);
-
-    if (verticalOverflow <= FIT_TOLERANCE_PX && horizontalOverflow <= FIT_TOLERANCE_PX) {
-      return {
-        profile,
-        html,
-        page: result.page,
-        metrics: result.metrics
+  try {
+    for (const candidate of candidates) {
+      const metrics = await page.evaluate(async (variables) => {
+        for (const [name, value] of Object.entries(variables)) {
+          document.documentElement.style.setProperty(name, value);
+        }
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        const resume = document.querySelector("#resume-page");
+        const pageRect = resume.getBoundingClientRect();
+        const descendants = Array.from(resume.querySelectorAll("*"));
+        const contentRect = descendants.reduce((acc, element) => {
+          const rect = element.getBoundingClientRect();
+          return {
+            bottom: Math.max(acc.bottom, rect.bottom - pageRect.top),
+            right: Math.max(acc.right, rect.right - pageRect.left)
+          };
+        }, { bottom: 0, right: 0 });
+        return {
+          height: Math.ceil(contentRect.bottom),
+          width: Math.ceil(contentRect.right),
+          pageHeight: Math.ceil(pageRect.height),
+          pageWidth: Math.ceil(pageRect.width),
+          viewportHeight: window.innerHeight,
+          viewportWidth: window.innerWidth
+        };
+      }, candidate.cssVariables);
+      const verticalOverflow = Math.max(0, metrics.height - (metrics.pageHeight || A4_HEIGHT_PX));
+      const horizontalOverflow = Math.max(0, metrics.width - (metrics.pageWidth || A4_WIDTH_PX));
+      const result = {
+        candidate,
+        metrics,
+        verticalOverflow,
+        horizontalOverflow,
+        overflow: Math.max(verticalOverflow, horizontalOverflow)
       };
+      if (verticalOverflow <= FIT_TOLERANCE_PX && horizontalOverflow <= FIT_TOLERANCE_PX) {
+        return { ...result, page };
+      }
+      lastResult = result;
     }
-
-    await result.page.close();
-    lastResult = { profile, metrics: result.metrics, verticalOverflow, horizontalOverflow };
+  } catch (error) {
+    await page.close();
+    throw error;
   }
 
-  const overflow = Math.max(lastResult?.verticalOverflow || 0, lastResult?.horizontalOverflow || 0);
+  await page.close();
+  const mode = preferred.settings.mode;
   throw new Error([
-    "Content does not fit one A4 page after tight profile.",
-    `Overflow: ${overflow}px.`,
+    mode === "fixed"
+      ? "Fixed layout does not fit one A4 page."
+      : "Content does not fit one A4 page after automatic minimum layout.",
+    `Overflow: ${lastResult?.overflow || 0}px.`,
     "Suggestion: shorten the longest section or reduce 1-2 bullet items."
   ].join("\n"));
 }
@@ -387,34 +368,47 @@ export async function generateResume(options = {}) {
   const verifyPdf = options.verifyPdf || assertOnePage;
   const renderPngFile = options.renderPngFile || renderPng;
   const browser = await launchBrowser();
+  let stagingDir = null;
 
   try {
-    const selected = await selectDensity(browser, data, photoSrc, {
+    const selected = await selectLayoutCandidate(browser, data, photoSrc, {
       cssFile,
       dataRoot,
       templateFile
     });
-    const pngPrefix = path.join(paths.outputDir, "resume");
+    stagingDir = mkdtempSync(path.join(paths.outputDir, ".generate-"));
+    const stagedPreview = path.join(stagingDir, "preview.html");
+    const stagedPdf = path.join(stagingDir, "resume.pdf");
+    const stagedPng = path.join(stagingDir, "resume.png");
+    const pngPrefix = path.join(stagingDir, "resume");
     const previewHtml = renderResumeHtml(data, {
-      density: selected.profile.name,
+      layoutCandidate: selected.candidate,
       templateFile,
       cssText,
       photoSrc
     });
 
-    writeFileSync(paths.previewHtml, previewHtml);
-    await selected.page.pdf({
-      path: paths.pdf,
-      format: "A4",
-      printBackground: true,
-      margin: { top: "0", right: "0", bottom: "0", left: "0" }
-    });
-    await selected.page.close();
+    writeFileSync(stagedPreview, previewHtml);
+    try {
+      await selected.page.pdf({
+        path: stagedPdf,
+        format: "A4",
+        printBackground: true,
+        margin: { top: "0", right: "0", bottom: "0", left: "0" }
+      });
+    } finally {
+      await selected.page.close();
+    }
 
-    verifyPdf(paths.pdf);
-    renderPngFile(paths.pdf, pngPrefix);
+    verifyPdf(stagedPdf);
+    renderPngFile(stagedPdf, pngPrefix);
+    renameSync(stagedPreview, paths.previewHtml);
+    renameSync(stagedPdf, paths.pdf);
+    renameSync(stagedPng, paths.png);
 
-    console.log(`Selected density: ${selected.profile.name}`);
+    const density = compatibilityDensity(selected.candidate);
+    const layout = publicLayoutCandidate(selected.candidate);
+    console.log(`Selected layout: ${layout.mode}, ${layout.fontSizePt}pt, line ${layout.lineHeight}, spacing ${layout.spacingLevel}, margin ${layout.marginPreset}`);
     console.log(`Measured content height: ${selected.metrics.height}px`);
     console.log(`Wrote: ${path.relative(dataRoot, paths.previewHtml)}`);
     console.log(`Wrote: ${path.relative(dataRoot, paths.pdf)}`);
@@ -422,8 +416,10 @@ export async function generateResume(options = {}) {
 
     return {
       resumeId,
-      density: selected.profile.name,
+      density,
+      layout,
       metrics: selected.metrics,
+      overflow: { vertical: 0, horizontal: 0, total: 0 },
       outputPaths: {
         preview: paths.previewHtml,
         pdf: paths.pdf,
@@ -431,6 +427,9 @@ export async function generateResume(options = {}) {
       }
     };
   } finally {
+    if (stagingDir) {
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
     await browser.close();
   }
 }
