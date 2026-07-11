@@ -77,8 +77,11 @@ button:disabled {
 .preview-toolbar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "primary actions"
+    "status status";
   align-items: center;
-  gap: 10px;
+  gap: 8px 10px;
   min-height: 52px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--line);
@@ -86,6 +89,7 @@ button:disabled {
 }
 
 .preview-toolbar-primary {
+  grid-area: primary;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -322,10 +326,12 @@ button:disabled {
 }
 
 .status-strip {
+  grid-area: status;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px;
   min-width: 0;
+  overflow: hidden;
 }
 
 .status-strip span {
@@ -339,6 +345,17 @@ button:disabled {
   background: var(--panel);
   font-size: 12px;
   white-space: nowrap;
+}
+
+.status-strip span:first-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status-strip span:not(:first-child) {
+  flex: 0 0 auto;
 }
 
 .status-strip .is-ok {
@@ -368,6 +385,7 @@ button:disabled {
 }
 
 .preview-actions {
+  grid-area: actions;
   flex: 0 0 auto;
   white-space: nowrap;
 }
@@ -1414,10 +1432,6 @@ button:disabled {
 }
 
 @container (max-width: 720px) {
-  .status-strip {
-    flex-basis: 100%;
-  }
-
   .resume-select-button {
     width: min(210px, calc(100cqw - 286px));
     min-width: 138px;

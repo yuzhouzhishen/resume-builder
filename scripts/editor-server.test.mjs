@@ -3109,6 +3109,62 @@ test("resume toolbar stays inside the preview pane at wide and narrow viewports"
   }
 });
 
+test("preview toolbar geometry stays fixed while a content draft is measured", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t, { viewport: { width: 1440, height: 900 } });
+  const toolbarGeometry = () => page.evaluate(() => {
+    const toolbar = document.querySelector(".preview-toolbar").getBoundingClientRect();
+    const switcher = document.querySelector(".resume-switcher").getBoundingClientRect();
+    const status = document.querySelector("#statusStrip").getBoundingClientRect();
+    const stage = document.querySelector(".preview-stage").getBoundingClientRect();
+    return {
+      toolbarHeight: toolbar.height,
+      statusTop: status.top,
+      switcherBottom: switcher.bottom,
+      stageTop: stage.top
+    };
+  });
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.waitForFunction(() => {
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return status.includes("行距") && status.includes("A4 单页");
+  });
+  const readyBeforeEdit = await toolbarGeometry();
+
+  await page.route("**/api/preview", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await route.continue();
+  });
+  await page.fill("[data-path='profile.name']", "工具栏稳定性测试");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("预览更新中"));
+  const pending = await toolbarGeometry();
+  await page.waitForFunction(() => {
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return status.includes("行距") && status.includes("草稿预览");
+  });
+  const readyAfterEdit = await toolbarGeometry();
+
+  assert.deepEqual(
+    [readyBeforeEdit.toolbarHeight, pending.toolbarHeight, readyAfterEdit.toolbarHeight],
+    [readyBeforeEdit.toolbarHeight, readyBeforeEdit.toolbarHeight, readyBeforeEdit.toolbarHeight]
+  );
+  assert.deepEqual(
+    [readyBeforeEdit.statusTop, pending.statusTop, readyAfterEdit.statusTop],
+    [readyBeforeEdit.statusTop, readyBeforeEdit.statusTop, readyBeforeEdit.statusTop]
+  );
+  assert.deepEqual(
+    [readyBeforeEdit.stageTop, pending.stageTop, readyAfterEdit.stageTop],
+    [readyBeforeEdit.stageTop, readyBeforeEdit.stageTop, readyBeforeEdit.stageTop]
+  );
+  assert.ok([readyBeforeEdit, pending, readyAfterEdit].every((geometry) => (
+    geometry.statusTop >= geometry.switcherBottom + 6
+  )));
+});
+
 test("dirty resume switching saves before activating the target", async (t) => {
   const rootDir = makeMultiResumeFixture();
   const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });

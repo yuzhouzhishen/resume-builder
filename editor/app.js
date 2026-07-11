@@ -1647,7 +1647,7 @@ function renderStatus() {
       ? "is-error"
       : "";
   elements.status.innerHTML = [
-    `<span>${escapeHtml(effectiveLayoutLabel())}</span>`,
+    `<span title="${attr(effectiveLayoutLabel())}">${escapeHtml(effectiveLayoutLabel())}</span>`,
     `<span>${escapeHtml(a4LayoutLabel())}</span>`,
     `<span class="${saveClass}">${state.dirty ? "未保存" : "已保存"}</span>`,
     `<span class="${generationClass}">${escapeHtml(generationLabel)}</span>`
