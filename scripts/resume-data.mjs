@@ -3,6 +3,11 @@ import path from "node:path";
 
 import yaml from "js-yaml";
 
+import {
+  LAYOUT_SETTING_KEYS,
+  resolveLayoutSettings,
+  validateLayoutSettings
+} from "./layout-settings.mjs";
 import { isSameOrNestedPath, resolvePathInside } from "./path-safety.mjs";
 
 const REQUIRED_TOP_LEVEL = ["profile", "skills", "internships", "projects"];
@@ -143,6 +148,18 @@ export function resolveResumeAssetPath(rootDir, assetPath) {
   return resolvePathInside(resolvedRoot, assetPath, "Photo path");
 }
 
+function layoutPreferences(layout = {}) {
+  return Object.fromEntries(
+    LAYOUT_SETTING_KEYS
+      .filter((key) => key in layout)
+      .map((key) => [key, layout[key]])
+  );
+}
+
+export function resolveResumeLayout(data) {
+  return resolveLayoutSettings(layoutPreferences(data?.layout || {}));
+}
+
 function validateLayout(layout) {
   if (layout == null) {
     return;
@@ -152,29 +169,36 @@ function validateLayout(layout) {
     throw new Error("layout must be an object");
   }
 
-  if (layout.sectionOrder == null) {
-    return;
-  }
-
-  if (!Array.isArray(layout.sectionOrder)) {
-    throw new Error("layout.sectionOrder must be an array");
-  }
-
-  const seen = new Set();
-  for (const section of layout.sectionOrder) {
-    if (!DEFAULT_SECTION_ORDER.includes(section)) {
-      throw new Error(`Unknown layout.sectionOrder section: ${section}`);
-    }
-
-    if (seen.has(section)) {
-      throw new Error(`Duplicate layout.sectionOrder section: ${section}`);
-    }
-    seen.add(section);
-  }
-
-  for (const section of DEFAULT_SECTION_ORDER) {
-    if (!seen.has(section)) {
-      throw new Error(`layout.sectionOrder must include section: ${section}`);
+  const allowedKeys = new Set(["sectionOrder", ...LAYOUT_SETTING_KEYS]);
+  for (const key of Object.keys(layout)) {
+    if (!allowedKeys.has(key)) {
+      throw new Error(`Unknown layout field: ${key}`);
     }
   }
+
+  if (layout.sectionOrder != null) {
+    if (!Array.isArray(layout.sectionOrder)) {
+      throw new Error("layout.sectionOrder must be an array");
+    }
+
+    const seen = new Set();
+    for (const section of layout.sectionOrder) {
+      if (!DEFAULT_SECTION_ORDER.includes(section)) {
+        throw new Error(`Unknown layout.sectionOrder section: ${section}`);
+      }
+
+      if (seen.has(section)) {
+        throw new Error(`Duplicate layout.sectionOrder section: ${section}`);
+      }
+      seen.add(section);
+    }
+
+    for (const section of DEFAULT_SECTION_ORDER) {
+      if (!seen.has(section)) {
+        throw new Error(`layout.sectionOrder must include section: ${section}`);
+      }
+    }
+  }
+
+  validateLayoutSettings(layoutPreferences(layout));
 }

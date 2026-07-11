@@ -14,6 +14,7 @@ import {
   saveResumeYaml,
   validateResume
 } from "./generate.mjs";
+import { resolveResumeLayout } from "./resume-data.mjs";
 
 const validResume = {
   profile: {
@@ -209,6 +210,63 @@ test("validateResume accepts layout section order", () => {
   };
 
   assert.equal(validateResume(data, dir), data);
+});
+
+test("validateResume accepts per-resume layout preferences", () => {
+  const dir = makeFixture();
+  const data = structuredClone(validResume);
+  data.layout = {
+    sectionOrder: ["internships", "skills", "projects"],
+    mode: "fixed",
+    fontSizePt: 10.5,
+    lineHeight: 1.3,
+    spacingLevel: 50,
+    marginPreset: "narrow"
+  };
+
+  assert.equal(validateResume(data, dir), data);
+  assert.deepEqual(resolveResumeLayout(data), {
+    mode: "fixed",
+    fontSizePt: 10.5,
+    lineHeight: 1.3,
+    spacingLevel: 50,
+    marginPreset: "narrow"
+  });
+});
+
+test("old layout resolves defaults without mutating YAML data", () => {
+  const dir = makeFixture();
+  const data = structuredClone(validResume);
+  data.layout = {
+    sectionOrder: ["internships", "skills", "projects"]
+  };
+  const before = structuredClone(data.layout);
+
+  validateResume(data, dir);
+
+  assert.deepEqual(data.layout, before);
+  assert.equal(resolveResumeLayout(data).fontSizePt, 10.8);
+  assert.deepEqual(data.layout, before);
+});
+
+test("validateResume rejects unknown and invalid layout preferences", () => {
+  const dir = makeFixture();
+  const unknown = structuredClone(validResume);
+  unknown.layout = {
+    sectionOrder: ["internships", "skills", "projects"],
+    color: "blue"
+  };
+  assert.throws(() => validateResume(unknown, dir), /Unknown layout field: color/);
+
+  const invalid = structuredClone(validResume);
+  invalid.layout = {
+    sectionOrder: ["internships", "skills", "projects"],
+    fontSizePt: 9
+  };
+  assert.throws(
+    () => validateResume(invalid, dir),
+    /layout.fontSizePt must be between 10.2 and 11.2 in 0.1 steps/
+  );
 });
 
 test("validateResume rejects unknown layout section names", () => {
