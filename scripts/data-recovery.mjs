@@ -35,6 +35,9 @@ export function createDataRecoveryManager(options) {
   const rename = options.rename || renameSync;
   const validate = options.validate || validateDataRoot;
   const pathLstat = options.pathLstat || lstatSync;
+  const openDirectory = options.openDirectory || openSync;
+  const fstatDirectory = options.fstatDirectory || fstatSync;
+  const closeDirectory = options.closeDirectory || closeSync;
   let restoring = false;
   let ownedStaging = null;
 
@@ -115,10 +118,11 @@ export function createDataRecoveryManager(options) {
         );
       }
       try {
-        ownedStaging = {
-          root: stagingRoot,
-          identity: readDirectoryIdentity(stagingRoot)
-        };
+        ownedStaging = claimOwnedDirectory(stagingRoot, {
+          openDirectory,
+          fstatDirectory,
+          closeDirectory
+        });
       } catch {
         throw createStatusError(
           "Restore staging ownership could not be verified.",
@@ -326,7 +330,7 @@ export function createDataRecoveryManager(options) {
         );
       }
 
-      ownedStaging = null;
+      releaseOwnedStaging();
       let registry;
       let finalFailure;
       try {
@@ -400,9 +404,7 @@ export function createDataRecoveryManager(options) {
         preRestoreBackup: path.basename(backupRoot)
       };
     } finally {
-      if (ownedStaging) {
-        ownedStaging = null;
-      }
+      releaseOwnedStaging();
       restoring = false;
     }
   }
@@ -411,17 +413,28 @@ export function createDataRecoveryManager(options) {
     if (restoring) {
       return;
     }
-    if (ownedStaging) {
-      ownedStaging = null;
-    }
+    releaseOwnedStaging();
   }
 
   function verifyOwnedStaging(rootDir = ownedStaging.root) {
-    if (!matchesOwnedDirectory(ownedStaging, rootDir)) {
-      ownedStaging = null;
+    if (!matchesOwnedDirectory(ownedStaging, rootDir, fstatDirectory)) {
+      releaseOwnedStaging();
       return false;
     }
     return true;
+  }
+
+  function releaseOwnedStaging() {
+    if (!ownedStaging) {
+      return;
+    }
+    const descriptor = ownedStaging.descriptor;
+    ownedStaging = null;
+    try {
+      closeDirectory(descriptor);
+    } catch {
+      // Cleanup must not hide the restore outcome.
+    }
   }
 
   function isRestoring() {
@@ -634,20 +647,43 @@ function readDirectoryIdentity(rootDir) {
   return { dev: stats.dev, ino: stats.ino };
 }
 
-function assertOwnedDirectory(ownedDirectory, rootDir = ownedDirectory.root) {
-  const identity = readDirectoryIdentity(rootDir);
-  if (
-    identity.dev !== ownedDirectory.identity.dev
-    || identity.ino !== ownedDirectory.identity.ino
-  ) {
-    throw new Error("Filesystem directory identity changed");
+function claimOwnedDirectory(rootDir, { openDirectory, fstatDirectory, closeDirectory }) {
+  const descriptor = openDirectory(
+    rootDir,
+    constants.O_RDONLY | (constants.O_DIRECTORY || 0) | (constants.O_NOFOLLOW || 0)
+  );
+  try {
+    const openedStats = fstatDirectory(descriptor);
+    const pathStats = lstatSync(rootDir);
+    if (
+      !openedStats.isDirectory()
+      || !pathStats.isDirectory()
+      || openedStats.dev !== pathStats.dev
+      || openedStats.ino !== pathStats.ino
+    ) {
+      throw new Error("Filesystem directory identity changed while it was claimed");
+    }
+    return { root: rootDir, descriptor };
+  } catch (error) {
+    try {
+      closeDirectory(descriptor);
+    } catch {
+      // Preserve the ownership error.
+    }
+    throw error;
   }
 }
 
-function matchesOwnedDirectory(ownedDirectory, rootDir = ownedDirectory.root) {
+function matchesOwnedDirectory(
+  ownedDirectory,
+  rootDir = ownedDirectory.root,
+  fstatDirectory = fstatSync
+) {
   let stats;
+  let openedStats;
   try {
     stats = lstatSync(rootDir);
+    openedStats = fstatDirectory(ownedDirectory.descriptor);
   } catch (error) {
     if (error.code === "ENOENT" || error.code === "ENOTDIR") {
       return false;
@@ -656,8 +692,9 @@ function matchesOwnedDirectory(ownedDirectory, rootDir = ownedDirectory.root) {
   }
   return (
     stats.isDirectory()
-    && stats.dev === ownedDirectory.identity.dev
-    && stats.ino === ownedDirectory.identity.ino
+    && openedStats.isDirectory()
+    && stats.dev === openedStats.dev
+    && stats.ino === openedStats.ino
   );
 }
 

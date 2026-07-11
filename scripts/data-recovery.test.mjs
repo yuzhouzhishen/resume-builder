@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants,
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readlinkSync,
   readdirSync,
@@ -1264,6 +1267,39 @@ test("restore abandons disproven staging ownership after publication identity lo
   manager.dispose();
   assert.equal(existsSync(quarantineRoot), true);
   assert.deepEqual(removeCalls, []);
+});
+
+test("restore holds the staging directory open through publication identity checks", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-handle-token`);
+  let openedRoot = null;
+  let published = false;
+  let closedAfterPublication = false;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "handle-token",
+    openDirectory(rootDir, flags) {
+      openedRoot = rootDir;
+      assert.equal((flags & constants.O_DIRECTORY) === constants.O_DIRECTORY, true);
+      return openSync(rootDir, flags);
+    },
+    closeDirectory(descriptor) {
+      closedAfterPublication = published;
+      closeSync(descriptor);
+    },
+    rename(sourceRoot, targetRoot) {
+      renameSync(sourceRoot, targetRoot);
+      if (sourceRoot === stagingRoot && targetRoot === dataRoot) {
+        published = true;
+      }
+    }
+  });
+
+  manager.restore(snapshotId(source.basename));
+
+  assert.equal(openedRoot, stagingRoot);
+  assert.equal(closedAfterPublication, true);
 });
 
 test("discovers both snapshot types with newest-first timestamps and registry metadata", (t) => {
