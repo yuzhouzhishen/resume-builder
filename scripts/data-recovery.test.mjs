@@ -14,7 +14,6 @@ import {
   rmSync,
   symlinkSync,
   unlinkSync,
-  utimesSync,
   writeFileSync
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -114,7 +113,7 @@ function createPathError(code, target) {
 }
 
 test("restores a snapshot through a staged transaction without consuming its source", (t) => {
-  const { dataRoot } = makeDataRoot(t);
+  const { parent, dataRoot } = makeDataRoot(t);
   writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
   writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
@@ -137,6 +136,10 @@ test("restores a snapshot through a staged transaction without consuming its sou
   assert.equal(result.preRestoreBackup, `${path.basename(dataRoot)}.pre-restore-20260711-080910`);
   assert.equal(path.isAbsolute(result.preRestoreBackup), false);
   assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.deepEqual(
+    readdirSync(parent).filter((entry) => entry.startsWith(`.${path.basename(dataRoot)}.recovery-lock`)),
+    []
+  );
   assert.equal(
     readFileSync(
       path.join(path.dirname(dataRoot), result.preRestoreBackup, "assets/photo.svg"),
@@ -149,6 +152,10 @@ test("restores a snapshot through a staged transaction without consuming its sou
   assert.equal(existsSync(source.rootDir), true);
   assert.deepEqual(readFileSync(path.join(source.rootDir, "assets/photo.svg")), sourceBefore);
   assert.equal(restoredAgain.preRestoreBackup, `${path.basename(dataRoot)}.pre-restore-20260711-080910-2`);
+  assert.deepEqual(
+    readdirSync(parent).filter((entry) => entry.startsWith(`.${path.basename(dataRoot)}.recovery-lock`)),
+    []
+  );
 });
 
 test("preserves an existing pre-restore timestamp path and uses the next suffix", (t) => {
@@ -228,430 +235,6 @@ test("sanitizes non-ENOENT pre-restore backup allocation failures", (t) => {
   assert.equal(existsSync(stagingRoot), true);
   assert.equal(existsSync(backupRoot), false);
   assert.equal(existsSync(dataRoot), true);
-  assert.equal(existsSync(source.rootDir), true);
-});
-
-test("recovery lock blocks another manager before restore path selection", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const selectedId = snapshotId(source.basename);
-  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
-  let firstManager;
-  let secondManager;
-  let lockPresentDuringCopy = false;
-  let secondSucceeded = false;
-  let secondError;
-  let secondDuringReleaseError;
-  let secondTokenCalls = 0;
-  let secondNowCalls = 0;
-  let releaseCalls = 0;
-  let restoringDuringRelease;
-  secondManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "second-lock-token",
-    tokenFactory() {
-      secondTokenCalls += 1;
-      return "second-restore-token";
-    },
-    now() {
-      secondNowCalls += 1;
-      return new Date("2026-07-11T08:09:10.000Z");
-    }
-  });
-  firstManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "first-lock-token",
-    tokenFactory: () => "first-restore-token",
-    now: () => new Date("2026-07-11T08:09:10.000Z"),
-    copy(sourceRoot, targetRoot, options) {
-      cpSync(sourceRoot, targetRoot, options);
-      lockPresentDuringCopy = existsSync(lockRoot);
-      try {
-        secondManager.restore(selectedId);
-        secondSucceeded = true;
-      } catch (error) {
-        secondError = error;
-      }
-    },
-    releaseRename(sourceRoot, targetRoot) {
-      releaseCalls += 1;
-      assert.equal(sourceRoot, lockRoot);
-      restoringDuringRelease = firstManager.isRestoring();
-      firstManager.dispose();
-      secondDuringReleaseError = captureError(() => secondManager.restore(selectedId));
-      renameSync(sourceRoot, targetRoot);
-    }
-  });
-
-  const result = firstManager.restore(selectedId);
-
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.equal(lockPresentDuringCopy, true);
-  assert.equal(secondSucceeded, false);
-  assert.equal(secondError.statusCode, 423);
-  assert.equal(secondError.code, "restore-locked");
-  assert.equal(secondError.message.includes(parent), false);
-  assert.equal(secondDuringReleaseError.statusCode, 423);
-  assert.equal(secondDuringReleaseError.code, "restore-locked");
-  assert.equal(secondDuringReleaseError.message.includes(parent), false);
-  assert.equal(secondTokenCalls, 0);
-  assert.equal(secondNowCalls, 0);
-  assert.equal(releaseCalls, 1);
-  assert.equal(restoringDuringRelease, true);
-  assert.equal(existsSync(lockRoot), false);
-  assert.equal(existsSync(backupRoot), true);
-  assert.equal(existsSync(`${backupRoot}-2`), false);
-  assert.equal(firstManager.isRestoring(), false);
-  assert.equal(secondManager.isRestoring(), false);
-});
-
-test("recovery releases its canonical lock by leaving an exact tombstone", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const selectedId = snapshotId(source.basename);
-  const basename = path.basename(dataRoot);
-  const lockRoot = path.join(parent, `.${basename}.recovery-lock`);
-  const releaseRoot = path.join(parent, `.${basename}.recovery-lock-released-normal-release`);
-  const tombstoneRoot = path.join(releaseRoot, "lock");
-  let canonicalBytes;
-  let canonicalIdentity;
-  const manager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "normal-owner",
-    releaseTokenFactory: () => "normal-release",
-    tokenFactory: () => "normal-restore",
-    copy(sourceRoot, stagingRoot, options) {
-      cpSync(sourceRoot, stagingRoot, options);
-      canonicalBytes = readFileSync(lockRoot);
-      canonicalIdentity = lstatSync(lockRoot);
-    }
-  });
-
-  const result = manager.restore(selectedId);
-
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.equal(existsSync(lockRoot), false);
-  assert.deepEqual(readFileSync(tombstoneRoot), canonicalBytes);
-  assert.equal(lstatSync(tombstoneRoot).dev, canonicalIdentity.dev);
-  assert.equal(lstatSync(tombstoneRoot).ino, canonicalIdentity.ino);
-  const laterManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "later-owner",
-    releaseTokenFactory: () => "later-release",
-    tokenFactory: () => "later-restore"
-  });
-  const laterResult = laterManager.restore(selectedId);
-  assert.deepEqual(laterResult.registry, validateDataRoot(dataRoot));
-  assert.equal(existsSync(lockRoot), false);
-  assert.equal(existsSync(tombstoneRoot), true);
-  assert.equal(
-    existsSync(path.join(parent, `.${basename}.recovery-lock-released-later-release`, "lock")),
-    true
-  );
-});
-
-test("recovery lock release chooses a unique tombstone without overwriting a collision", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const basename = path.basename(dataRoot);
-  const releaseRoot = path.join(parent, `.${basename}.recovery-lock-released-collision`);
-  const existingTombstone = path.join(releaseRoot, "lock");
-  const nextTombstone = path.join(`${releaseRoot}-2`, "lock");
-  mkdirSync(releaseRoot, { mode: 0o700 });
-  writeFileSync(existingTombstone, "existing tombstone");
-  const existingIdentity = lstatSync(existingTombstone);
-  const manager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "collision-owner",
-    releaseTokenFactory: () => "collision",
-    tokenFactory: () => "collision-restore"
-  });
-
-  const result = manager.restore(snapshotId(source.basename));
-
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.equal(readFileSync(existingTombstone, "utf8"), "existing tombstone");
-  assert.equal(lstatSync(existingTombstone).dev, existingIdentity.dev);
-  assert.equal(lstatSync(existingTombstone).ino, existingIdentity.ino);
-  assert.deepEqual(JSON.parse(readFileSync(nextTombstone, "utf8")), {
-    pid: process.pid,
-    token: "collision-owner"
-  });
-});
-
-test("recovery lock leaves a demonstrably stale owner unchanged for every manager", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  writeFileSync(
-    lockRoot,
-    `${JSON.stringify({ pid: 999999, token: "dead-lock-token" })}\n`,
-    { flag: "wx", mode: 0o600 }
-  );
-  const lockBytes = readFileSync(lockRoot);
-  const lockIdentity = lstatSync(lockRoot);
-  let livenessChecks = 0;
-  const managers = ["first", "second"].map((name) => createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => `${name}-replacement-lock-token`,
-    tokenFactory: () => `${name}-stale-lock-restore-token`,
-    isProcessAlive(pid) {
-      livenessChecks += 1;
-      assert.equal(pid, 999999);
-      return false;
-    }
-  }));
-
-  for (const manager of managers) {
-    const error = captureError(() => manager.restore(snapshotId(source.basename)));
-    assert.equal(error.statusCode, 423);
-    assert.equal(error.code, "restore-lock-stale");
-    assert.equal(error.message.includes(parent), false);
-    assert.deepEqual(readFileSync(lockRoot), lockBytes);
-    assert.equal(lstatSync(lockRoot).dev, lockIdentity.dev);
-    assert.equal(lstatSync(lockRoot).ino, lockIdentity.ino);
-  }
-
-  assert.equal(livenessChecks, 2);
-  assert.equal(existsSync(lockRoot), true);
-  assert.equal(existsSync(source.rootDir), true);
-  assert.equal(
-    readdirSync(parent).some((entry) => entry.endsWith(".tmp")),
-    false
-  );
-});
-
-test("recovery lock leaves invalid files unchanged regardless of age", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const selectedId = snapshotId(source.basename);
-  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  writeFileSync(lockRoot, "", { flag: "wx", mode: 0o600 });
-  const manager = createDataRecoveryManager({ dataRoot });
-  const lockIdentity = lstatSync(lockRoot);
-
-  const freshError = captureError(() => manager.restore(selectedId));
-
-  assert.equal(freshError.statusCode, 423);
-  assert.equal(freshError.code, "restore-lock-invalid");
-  assert.equal(freshError.message.includes(parent), false);
-  assert.equal(existsSync(lockRoot), true);
-  const oldTime = new Date(Date.now() - 10 * 60 * 1000);
-  utimesSync(lockRoot, oldTime, oldTime);
-
-  const staleError = captureError(() => manager.restore(selectedId));
-
-  assert.equal(staleError.statusCode, 423);
-  assert.equal(staleError.code, "restore-lock-invalid");
-  assert.equal(staleError.message.includes(parent), false);
-  assert.equal(existsSync(lockRoot), true);
-  assert.deepEqual(readFileSync(lockRoot), Buffer.alloc(0));
-  assert.equal(lstatSync(lockRoot).dev, lockIdentity.dev);
-  assert.equal(lstatSync(lockRoot).ino, lockIdentity.ino);
-  assert.equal(existsSync(source.rootDir), true);
-});
-
-test("committed recovery reports lock release warning and retries before another restore", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const selectedId = snapshotId(source.basename);
-  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  let lockReleaseCalls = 0;
-  let restoreTokenCalls = 0;
-  const firstManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "release-retry-lock",
-    releaseTokenFactory: () => "release-retry-move",
-    tokenFactory() {
-      restoreTokenCalls += 1;
-      return "release-retry-restore";
-    },
-    releaseRename(sourceRoot, targetRoot) {
-      assert.equal(sourceRoot, lockRoot);
-      lockReleaseCalls += 1;
-      if (lockReleaseCalls <= 2) {
-        throw new Error(`release failed at ${parent}`);
-      }
-      renameSync(sourceRoot, targetRoot);
-    }
-  });
-
-  const result = firstManager.restore(selectedId);
-
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.equal(path.isAbsolute(result.preRestoreBackup), false);
-  assert.deepEqual(result.warnings, [{
-    code: "restore-lock-release-pending",
-    message: "Recovery completed, but its lock still needs cleanup."
-  }]);
-  assert.equal(lstatSync(lockRoot).isFile(), true);
-  const retryError = captureError(() => firstManager.restore(selectedId));
-  assert.equal(retryError.statusCode, 423);
-  assert.equal(retryError.code, "restore-lock-release-pending");
-  assert.equal(retryError.message.includes(parent), false);
-  assert.equal(restoreTokenCalls, 1);
-  assert.equal(existsSync(lockRoot), true);
-  firstManager.dispose();
-  assert.equal(lockReleaseCalls, 3);
-  assert.equal(existsSync(lockRoot), false);
-
-  const secondManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "later-manager-lock",
-    tokenFactory: () => "later-manager-restore"
-  });
-  const laterResult = secondManager.restore(selectedId);
-  assert.deepEqual(laterResult.registry, validateDataRoot(dataRoot));
-  assert.equal(existsSync(lockRoot), false);
-});
-
-test("recovery release preserves a replacement moved by the atomic rename seam", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const selectedId = snapshotId(source.basename);
-  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  const tombstoneRoot = path.join(
-    parent,
-    `.${path.basename(dataRoot)}.recovery-lock-released-replacement-release`,
-    "lock"
-  );
-  let restoreTokenCalls = 0;
-  let replacementBytes;
-  let replacementIdentity;
-  let canonicalUnlinkCalls = 0;
-  const manager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "lost-release-lock",
-    releaseTokenFactory: () => "replacement-release",
-    tokenFactory() {
-      restoreTokenCalls += 1;
-      return "lost-release-restore";
-    },
-    releaseRename(sourceRoot, targetRoot) {
-      assert.equal(sourceRoot, lockRoot);
-      unlinkSync(sourceRoot);
-      writeFileSync(
-        sourceRoot,
-        `${JSON.stringify({ pid: process.pid, token: "replacement-lock" })}\n`,
-        { flag: "wx", mode: 0o600 }
-      );
-      replacementBytes = readFileSync(sourceRoot);
-      replacementIdentity = lstatSync(sourceRoot);
-      renameSync(sourceRoot, targetRoot);
-    },
-    unlink(target) {
-      if (target === lockRoot || target === tombstoneRoot) {
-        canonicalUnlinkCalls += 1;
-      }
-      unlinkSync(target);
-    }
-  });
-
-  const result = manager.restore(selectedId);
-
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.deepEqual(result.warnings, [{
-    code: "restore-lock-release-identity-lost",
-    message: "Recovery completed, but its lock ownership changed during cleanup."
-  }]);
-  assert.equal(canonicalUnlinkCalls, 0);
-  assert.deepEqual(readFileSync(lockRoot), replacementBytes);
-  assert.equal(lstatSync(lockRoot).dev, replacementIdentity.dev);
-  assert.equal(lstatSync(lockRoot).ino, replacementIdentity.ino);
-  assert.deepEqual(readFileSync(tombstoneRoot), replacementBytes);
-  assert.equal(lstatSync(tombstoneRoot).dev, replacementIdentity.dev);
-  assert.equal(lstatSync(tombstoneRoot).ino, replacementIdentity.ino);
-  const retryError = captureError(() => manager.restore(selectedId));
-  assert.equal(retryError.statusCode, 423);
-  assert.equal(retryError.code, "restore-locked");
-  assert.equal(restoreTokenCalls, 1);
-  assert.deepEqual(readFileSync(lockRoot), replacementBytes);
-  assert.equal(lstatSync(lockRoot).dev, replacementIdentity.dev);
-  assert.equal(lstatSync(lockRoot).ino, replacementIdentity.ino);
-  manager.dispose();
-  assert.deepEqual(readFileSync(lockRoot), replacementBytes);
-  assert.equal(lstatSync(lockRoot).dev, replacementIdentity.dev);
-  assert.equal(lstatSync(lockRoot).ino, replacementIdentity.ino);
-  assert.equal(canonicalUnlinkCalls, 0);
-});
-
-test("recovery releases a partially acquired lock after claimed-owner verification fails", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const selectedId = snapshotId(source.basename);
-  const lockPath = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  let verificationCalls = 0;
-  const firstManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "partial-claim-lock",
-    tokenFactory: () => "partial-claim-restore",
-    verifyClaimedLock() {
-      verificationCalls += 1;
-      throw new Error(`claimed owner read failed at ${parent}`);
-    }
-  });
-
-  const error = captureError(() => firstManager.restore(selectedId));
-
-  assert.equal(error.statusCode, 500);
-  assert.equal(error.code, "restore-lock-acquire-failed");
-  assert.equal(error.message.includes(parent), false);
-  assert.equal(verificationCalls, 1);
-  assert.equal(existsSync(lockPath), false);
-  assert.equal(
-    readdirSync(parent).some((entry) => entry.endsWith(".tmp")),
-    false
-  );
-  firstManager.dispose();
-
-  const secondManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "second-partial-claim-lock",
-    tokenFactory: () => "second-partial-claim-restore"
-  });
-  const result = secondManager.restore(selectedId);
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.equal(existsSync(lockPath), false);
-});
-
-test("recovery never releases a replacement after partial lock acquisition", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const selectedId = snapshotId(source.basename);
-  const lockPath = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  const manager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "replaced-partial-lock",
-    tokenFactory: () => "replaced-partial-restore",
-    verifyClaimedLock(claimedPath) {
-      unlinkSync(claimedPath);
-      writeFileSync(
-        claimedPath,
-        `${JSON.stringify({ pid: process.pid, token: "foreign-owner" })}\n`,
-        { flag: "wx", mode: 0o600 }
-      );
-      throw new Error(`claimed lock replaced at ${parent}`);
-    }
-  });
-
-  const error = captureError(() => manager.restore(selectedId));
-
-  assert.equal(error.code, "restore-lock-acquire-failed");
-  assert.equal(error.message.includes(parent), false);
-  assert.equal(lstatSync(lockPath).isFile(), true);
-  assert.deepEqual(JSON.parse(readFileSync(lockPath, "utf8")), {
-    pid: process.pid,
-    token: "foreign-owner"
-  });
-  const blockedManager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "blocked-after-replacement",
-    tokenFactory: () => "unused-after-replacement"
-  });
-  const blocked = captureError(() => blockedManager.restore(selectedId));
-  assert.equal(blocked.statusCode, 423);
-  assert.equal(blocked.code, "restore-locked");
   assert.equal(existsSync(source.rootDir), true);
 });
 
@@ -763,7 +346,6 @@ test("restore preserves owned staging when copy or staging validation fails", (t
     const options = {
       dataRoot,
       tokenFactory: () => token,
-      releaseTokenFactory: () => `${failure}-release`,
       remove(target, removeOptions) {
         removeCalls.push({ target, options: removeOptions });
         rmSync(target, removeOptions);
@@ -794,11 +376,7 @@ test("restore preserves owned staging when copy or staging validation fails", (t
     assert.equal(manager.isRestoring(), false);
     assert.deepEqual(
       readdirSync(parent).sort(),
-      [
-        ...entriesBefore,
-        `.${path.basename(dataRoot)}.recovery-lock-released-${failure}-release`,
-        path.basename(stagingRoot)
-      ].sort()
+      [...entriesBefore, path.basename(stagingRoot)].sort()
     );
     assert.deepEqual(readFileSync(path.join(dataRoot, "assets/photo.svg")), officialBefore);
     assert.deepEqual(readFileSync(path.join(source.rootDir, "assets/photo.svg")), sourceBefore);
@@ -807,6 +385,9 @@ test("restore preserves owned staging when copy or staging validation fails", (t
     assert.deepEqual(removeCalls, []);
     manager.dispose();
     assert.equal(existsSync(stagingRoot), true);
+    assert.deepEqual(readFileSync(path.join(dataRoot, "assets/photo.svg")), officialBefore);
+    assert.deepEqual(readFileSync(path.join(source.rootDir, "assets/photo.svg")), sourceBefore);
+    assert.deepEqual(readFileSync(path.join(otherSnapshot.rootDir, "resumes.json")), otherBefore);
     assert.deepEqual(removeCalls, []);
   }
 });
@@ -1161,49 +742,6 @@ test("restore rollback failure preserves every surviving root and reports manual
   assert.equal(manager.isRestoring(), false);
 });
 
-test("restore preserves rollback failure when lock release also fails", (t) => {
-  const { parent, dataRoot } = makeDataRoot(t);
-  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
-  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-priority-token`);
-  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
-  let renameCalls = 0;
-  const manager = createDataRecoveryManager({
-    dataRoot,
-    now: () => new Date("2026-07-11T08:09:10.000Z"),
-    tokenFactory: () => "priority-token",
-    rename(sourceRoot, targetRoot) {
-      renameCalls += 1;
-      if (renameCalls === 1) {
-        renameSync(sourceRoot, targetRoot);
-        return;
-      }
-      if (renameCalls === 2) {
-        throw new Error(`publish failed at ${parent}`);
-      }
-      throw new Error(`rollback failed at ${parent}`);
-    },
-    releaseRename(sourceRoot) {
-      assert.equal(sourceRoot, lockRoot);
-      throw new Error(`lock release failed at ${parent}`);
-    }
-  });
-
-  const error = captureError(() => manager.restore(snapshotId(source.basename)));
-
-  assert.equal(error.statusCode, 500);
-  assert.equal(error.code, "restore-rollback-failed");
-  assert.match(error.message, /previous data could not be restored.*manual recovery/i);
-  assert.equal(error.message.includes(parent), false);
-  assert.equal(renameCalls, 3);
-  assert.equal(existsSync(dataRoot), false);
-  assert.equal(existsSync(backupRoot), true);
-  assert.equal(existsSync(stagingRoot), true);
-  assert.equal(existsSync(lockRoot), true);
-  assert.equal(existsSync(source.rootDir), true);
-  assert.equal(manager.isRestoring(), false);
-});
-
 test("restore preserves failed staging and uses a unique path on deterministic retry", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
@@ -1255,14 +793,14 @@ test("restore preserves failed staging and uses a unique path on deterministic r
   assert.equal(manager.isRestoring(), false);
 });
 
-test("restore keeps its lock active while failed staging ownership is abandoned", (t) => {
+test("restore keeps manager-local exclusion active while failed staging is preserved", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-cleanup-lock-token`);
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-local-state-token`);
   let manager;
   let selectedId;
   let tokenCalls = 0;
-  let restoringDuringRelease;
+  let restoringDuringCopy;
   let stagingExistsAfterDispose;
   let nestedError;
   manager = createDataRecoveryManager({
@@ -1270,20 +808,17 @@ test("restore keeps its lock active while failed staging ownership is abandoned"
     tokenFactory() {
       tokenCalls += 1;
       if (tokenCalls === 1) {
-        return "cleanup-lock-token";
+        return "local-state-token";
       }
       throw new Error(`nested restore reached token creation at ${parent}`);
     },
     copy(sourceRoot, targetRoot, options) {
       cpSync(sourceRoot, targetRoot, options);
-      throw new Error(`copy failed at ${parent}`);
-    },
-    releaseRename(sourceRoot, targetRoot) {
-      restoringDuringRelease = manager.isRestoring();
+      restoringDuringCopy = manager.isRestoring();
       manager.dispose();
       stagingExistsAfterDispose = existsSync(stagingRoot);
       nestedError = captureError(() => manager.restore(selectedId));
-      renameSync(sourceRoot, targetRoot);
+      throw new Error(`copy failed at ${parent}`);
     }
   });
   selectedId = snapshotId(source.basename);
@@ -1292,7 +827,7 @@ test("restore keeps its lock active while failed staging ownership is abandoned"
 
   assert.equal(error.code, "restore-copy-failed");
   assert.equal(error.message.includes(parent), false);
-  assert.equal(restoringDuringRelease, true);
+  assert.equal(restoringDuringCopy, true);
   assert.equal(stagingExistsAfterDispose, true);
   assert.equal(nestedError.statusCode, 423);
   assert.equal(nestedError.code, "restore-locked");
@@ -1308,18 +843,14 @@ test("restore rejects unsafe tokens and allocates beside an existing staging dir
   const initialEntries = readdirSync(parent).sort();
   const unsafeManager = createDataRecoveryManager({
     dataRoot,
-    tokenFactory: () => "../escape",
-    releaseTokenFactory: () => "unsafe-token-release"
+    tokenFactory: () => "../escape"
   });
 
   const unsafeError = captureError(() => unsafeManager.restore(snapshotId(source.basename)));
 
   assert.equal(unsafeError.code, "invalid-restore-token");
   assert.equal(unsafeError.message.includes(parent), false);
-  assert.deepEqual(readdirSync(parent).sort(), [
-    ...initialEntries,
-    `.${path.basename(dataRoot)}.recovery-lock-released-unsafe-token-release`
-  ].sort());
+  assert.deepEqual(readdirSync(parent).sort(), initialEntries);
   assert.equal(unsafeManager.isRestoring(), false);
 
   const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-existing-token`);
