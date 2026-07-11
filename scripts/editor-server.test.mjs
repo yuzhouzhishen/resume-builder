@@ -131,6 +131,19 @@ async function selectedResumeId(page) {
   return page.getAttribute("#resumeSelectButton", "data-value");
 }
 
+function formatLocalDateTime(value) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(new Date(value)).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
 async function waitForPreviewInteractive(page) {
   await page.waitForFunction(() => {
     const iframe = document.querySelector("#previewFrame");
@@ -4142,11 +4155,11 @@ test("editor recovery center lists historical data accessibly and confirms befor
   const rowTexts = await page.locator(".recovery-snapshot-row").allTextContents();
   assert.equal(rowTexts.length, 12);
   assert.match(rowTexts[0], /恢复前备份/);
-  assert.match(rowTexts[0], /2026-07-11 08:09:10/);
+  assert.equal(rowTexts[0].includes(formatLocalDateTime(snapshots[0].createdAt)), true);
   assert.match(rowTexts[0], /2 份简历/);
   assert.match(rowTexts[0], /当前：一份非常长的活动简历名称/);
   assert.match(rowTexts[1], /导入前备份/);
-  assert.match(rowTexts[1], /2026-07-10 07:08:09/);
+  assert.equal(rowTexts[1].includes(formatLocalDateTime(snapshots[1].createdAt)), true);
   assert.match(rowTexts[1], /存在不安全文件，无法恢复/);
   assert.match(rowTexts[2], /恢复前备份/);
   assert.match(rowTexts[2], /数据文件无效，无法恢复/);
