@@ -26,6 +26,11 @@ const LOCK_RELEASE_WARNING = {
   code: "restore-lock-release-pending",
   message: "Recovery completed, but its lock still needs cleanup."
 };
+const LOCK_RELEASE_IDENTITY_LOST_CODE = "restore-lock-release-identity-lost";
+const LOCK_RELEASE_IDENTITY_LOST_WARNING = {
+  code: LOCK_RELEASE_IDENTITY_LOST_CODE,
+  message: "Recovery completed, but its lock ownership changed during cleanup."
+};
 
 export function listDataSnapshots(options) {
   return discoverDataSnapshots(options.dataRoot).map(({ summary }) => summary);
@@ -39,10 +44,13 @@ export function createDataRecoveryManager(options) {
   const now = options.now || (() => new Date());
   const tokenFactory = options.tokenFactory || randomUUID;
   const lockTokenFactory = options.lockTokenFactory || randomUUID;
+  const releaseTokenFactory = options.releaseTokenFactory || randomUUID;
   const copy = options.copy || cpSync;
   const link = options.link || linkSync;
   const mkdir = options.mkdir || mkdirSync;
   const rename = options.rename || renameSync;
+  const releaseMkdir = options.releaseMkdir || mkdirSync;
+  const releaseRename = options.releaseRename || renameSync;
   const unlink = options.unlink || unlinkSync;
   const verifyClaimedLock = options.verifyClaimedLock || readLockOwner;
   const validate = options.validate || validateDataRoot;
@@ -386,9 +394,9 @@ export function createDataRecoveryManager(options) {
         if (ownedLock) {
           try {
             releaseOwnedLock();
-          } catch {
+          } catch (error) {
             if (!primaryError && committedResult) {
-              committedResult.warnings = [{ ...LOCK_RELEASE_WARNING }];
+              committedResult.warnings = [{ ...lockReleaseWarning(error) }];
             }
           }
         }
@@ -408,7 +416,14 @@ export function createDataRecoveryManager(options) {
     if (ownedLock) {
       try {
         releaseOwnedLock();
-      } catch {
+      } catch (error) {
+        if (error.code === LOCK_RELEASE_IDENTITY_LOST_CODE) {
+          throw createStatusError(
+            "The recovery transaction lock ownership changed during release.",
+            500,
+            LOCK_RELEASE_IDENTITY_LOST_CODE
+          );
+        }
         throw createStatusError(
           "The recovery transaction lock could not be released.",
           500,
@@ -522,20 +537,48 @@ export function createDataRecoveryManager(options) {
   }
 
   function releaseOwnedLock() {
-    const owner = readLockOwner(ownedLock.path);
-    if (owner.pid !== ownedLock.pid || owner.token !== ownedLock.token) {
-      throw new Error("Recovery lock ownership metadata changed");
+    const releasedRoot = claimReleasedLockRoot();
+    const tombstonePath = path.join(releasedRoot, "lock");
+    releaseRename(ownedLock.path, tombstonePath);
+
+    try {
+      const movedOwner = readLockOwner(tombstonePath);
+      assertSameLockOwner(ownedLock, movedOwner);
+      ownedLock = null;
+    } catch {
+      ownedLock = null;
+      try {
+        link(tombstonePath, lockPath);
+      } catch {
+        // Preserve the moved entry without overwriting a new canonical lock.
+      }
+      const error = new Error("Recovery lock ownership changed during release");
+      error.code = LOCK_RELEASE_IDENTITY_LOST_CODE;
+      throw error;
     }
-    if (
-      owner.identity.dev !== ownedLock.identity.dev
-      || owner.identity.ino !== ownedLock.identity.ino
-    ) {
-      throw new Error("Recovery lock identity changed");
+  }
+
+  function claimReleasedLockRoot() {
+    const releaseToken = validateToken(releaseTokenFactory());
+    const basePath = path.join(
+      parentDir,
+      `.${dataBasename}.recovery-lock-released-${releaseToken}`
+    );
+    let candidatePath = basePath;
+    let suffix = 2;
+
+    while (true) {
+      try {
+        releaseMkdir(candidatePath, { recursive: false, mode: 0o700 });
+        return candidatePath;
+      } catch (error) {
+        if (error.code !== "EEXIST") {
+          throw error;
+        }
+        candidatePath = `${basePath}-${suffix}`;
+        suffix += 1;
+      }
     }
-    const currentOwner = readLockOwner(ownedLock.path);
-    assertSameLockOwner(owner, currentOwner);
-    unlink(ownedLock.path);
-    ownedLock = null;
   }
 
   function verifyOwnedStaging(rootDir = ownedStaging.root) {
@@ -746,6 +789,12 @@ function createStatusError(message, statusCode, code) {
   error.statusCode = statusCode;
   error.code = code;
   return error;
+}
+
+function lockReleaseWarning(error) {
+  return error.code === LOCK_RELEASE_IDENTITY_LOST_CODE
+    ? LOCK_RELEASE_IDENTITY_LOST_WARNING
+    : LOCK_RELEASE_WARNING;
 }
 
 function readDirectoryIdentity(rootDir) {
