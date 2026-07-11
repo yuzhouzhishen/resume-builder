@@ -1086,7 +1086,10 @@ test("editor protects edits, saves with keyboard shortcuts, and generates the la
   assert.match(await page.textContent("#statusStrip"), /已保存/);
   assert.equal(await page.textContent("#generateButton"), "生成 PDF");
   assert.equal(await page.locator("#generateButton").isDisabled(), false);
-  assert.match(await page.getAttribute("#previewFrame", "srcdoc"), /测试姓名/);
+  assert.match(
+    await page.frameLocator("#previewFrame").locator("[data-path='profile.name']").textContent(),
+    /测试姓名/
+  );
   assert.deepEqual(await dispatchBeforeUnload(page), {
     defaultPrevented: false,
     dispatchResult: true
@@ -1201,7 +1204,7 @@ test("draft preview applies layout candidates in order and selects the first A4 
   assert.match(await page.textContent("#statusStrip"), /自动.*10\.8pt.*行距 1\.32.*较紧.*标准边距/);
 });
 
-test("layout-only drafts reuse the preview document while content drafts reload it", async (t) => {
+test("layout and content drafts reuse the preview document with one atomic page swap", async (t) => {
   const rootDir = makeApiFixture();
   const resume = structuredClone(validResume);
   resume.layout = {
@@ -1247,17 +1250,41 @@ test("layout-only drafts reuse the preview document while content drafts reload 
   });
 
   await page.click("[data-area='content']");
-  await page.fill("[data-path='profile.name']", "内容变更仍需重载");
+  await page.locator("#previewFrame").evaluate((iframe) => {
+    window.__trackedPreviewPage = iframe.contentDocument.querySelector("#resume-page");
+    window.__trackedPreviewPageChanges = 0;
+    new iframe.contentWindow.MutationObserver((records) => {
+      if (records.some((record) => [...record.addedNodes, ...record.removedNodes].some((node) => (
+        node.nodeType === Node.ELEMENT_NODE && node.matches?.("#resume-page")
+      )))) {
+        window.__trackedPreviewPageChanges += 1;
+      }
+    }).observe(iframe.contentDocument.body, { childList: true });
+  });
+  await page.route("**/api/preview", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await route.continue();
+  });
+  await page.fill("[data-path='profile.name']", "正文原子替换测试");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("预览更新中"));
+  assert.match(
+    await page.frameLocator("#previewFrame").locator("[data-path='profile.name']").textContent(),
+    new RegExp(validResume.profile.name)
+  );
   await page.waitForFunction(() => {
     const iframe = document.querySelector("#previewFrame");
-    return iframe?.contentDocument?.querySelector("[data-path='profile.name']")?.textContent?.includes("内容变更仍需重载");
+    return iframe?.contentDocument?.querySelector("[data-path='profile.name']")?.textContent?.includes("正文原子替换测试");
   });
   assert.deepEqual(await page.locator("#previewFrame").evaluate((iframe) => ({
     sameDocument: iframe.contentDocument === window.__trackedPreviewDocument,
-    loadCount: window.__trackedPreviewLoads
+    samePage: iframe.contentDocument.querySelector("#resume-page") === window.__trackedPreviewPage,
+    loadCount: window.__trackedPreviewLoads,
+    pageChanges: window.__trackedPreviewPageChanges
   })), {
-    sameDocument: false,
-    loadCount: 1
+    sameDocument: true,
+    samePage: false,
+    loadCount: 0,
+    pageChanges: 1
   });
 });
 
@@ -1690,7 +1717,10 @@ test("editor lists recent backups and restores the selected backup after confirm
     .some((option) => option.value === "backups/cpp/resume-20260710-142530.yaml"));
   await page.fill("[data-path='profile.name']", "恢复前的未保存草稿");
   await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("草稿预览"));
-  assert.match(await page.getAttribute("#previewFrame", "srcdoc"), /恢复前的未保存草稿/);
+  assert.match(
+    await page.frameLocator("#previewFrame").locator("[data-path='profile.name']").textContent(),
+    /恢复前的未保存草稿/
+  );
   await page.selectOption("#backupSelect", "backups/cpp/resume-20260710-142530.yaml");
   await page.click("#restoreBackupButton");
   await page.waitForFunction(() => document.querySelector("#messageLine")?.textContent?.includes("已恢复备份"));
@@ -3256,7 +3286,12 @@ test("editor creates a resume from an allowlisted example and shows a draft prev
   await page.fill("#resumeDialogInput", "Agent Platform");
   await page.click("[data-dialog-action='confirm-example']");
   await page.waitForFunction(() => document.querySelector("[data-path='profile.target']")?.value === "AI Agent 应用开发工程师");
-  await page.waitForFunction(() => document.querySelector("#previewFrame")?.getAttribute("srcdoc")?.includes("AI Agent 应用开发工程师"));
+  await page.waitForFunction(() => document
+    .querySelector("#previewFrame")
+    ?.contentDocument
+    ?.querySelector("[data-path='profile.target']")
+    ?.textContent
+    ?.includes("AI Agent 应用开发工程师"));
 
   assert.equal(await selectedResumeId(page), "agent-platform");
   assert.match(await page.textContent("#statusStrip"), /PDF 待生成|草稿预览/);

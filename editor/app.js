@@ -427,9 +427,9 @@ function applyLayoutCandidateVariables(style, candidate) {
   }
 }
 
-function createLayoutMeasurementPage(documentInFrame) {
-  const visiblePage = documentInFrame.querySelector("#resume-page");
-  if (!visiblePage || !documentInFrame.body) {
+function createLayoutMeasurementPage(documentInFrame, sourcePage) {
+  const pageSource = sourcePage || documentInFrame.querySelector("#resume-page");
+  if (!pageSource || !documentInFrame.body) {
     return null;
   }
 
@@ -446,7 +446,7 @@ function createLayoutMeasurementPage(documentInFrame) {
     lineHeight: "var(--body-line-height)"
   });
 
-  const page = visiblePage.cloneNode(true);
+  const page = documentInFrame.importNode(pageSource, true);
   page.removeAttribute("id");
   page.dataset.layoutMeasurementPage = "true";
   host.append(page);
@@ -454,13 +454,16 @@ function createLayoutMeasurementPage(documentInFrame) {
   return { host, page };
 }
 
-async function selectDraftLayout(version = draftPreviewVersion) {
+async function selectDraftLayout(version = draftPreviewVersion, {
+  sourcePage = null,
+  applyToVisible = true
+} = {}) {
   const documentInFrame = previewDocument();
-  if (!documentInFrame?.querySelector("#resume-page")) {
+  if (!documentInFrame?.querySelector("#resume-page") || (sourcePage && !sourcePage.matches("#resume-page"))) {
     return null;
   }
 
-  const measurement = createLayoutMeasurementPage(documentInFrame);
+  const measurement = createLayoutMeasurementPage(documentInFrame, sourcePage);
   if (!measurement) {
     return null;
   }
@@ -491,10 +494,37 @@ async function selectDraftLayout(version = draftPreviewVersion) {
     measurement.host.remove();
   }
 
-  if (selected && version === draftPreviewVersion && previewDocument() === documentInFrame) {
+  if (selected
+    && applyToVisible
+    && version === draftPreviewVersion
+    && previewDocument() === documentInFrame) {
     applyLayoutCandidate(documentInFrame, selected.candidate);
   }
   return selected;
+}
+
+function draftPageFromHtml(documentInFrame, html) {
+  const parsed = new documentInFrame.defaultView.DOMParser().parseFromString(html, "text/html");
+  const page = parsed.querySelector("#resume-page");
+  return page ? documentInFrame.importNode(page, true) : null;
+}
+
+function commitDraftPage(documentInFrame, draftPage, selected, version, contentRevision) {
+  if (!selected
+    || version !== draftPreviewVersion
+    || previewDocument() !== documentInFrame
+    || contentRevision !== state.contentRevision) {
+    return false;
+  }
+
+  const visiblePage = documentInFrame.querySelector("#resume-page");
+  if (!visiblePage) {
+    return false;
+  }
+
+  applyLayoutCandidate(documentInFrame, selected.candidate);
+  visiblePage.replaceWith(draftPage);
+  return finalizeDraftPreview(selected, version, contentRevision);
 }
 
 function finalizeDraftPreview(selected, version, contentRevision) {
@@ -569,6 +599,20 @@ async function renderDraftPreview(version) {
       state.draftPreview = "measuring";
       const selected = await selectDraftLayout(version);
       finalizeDraftPreview(selected, version, contentRevision);
+      return;
+    }
+
+    const documentInFrame = previewDocument();
+    const draftPage = documentInFrame?.querySelector("#resume-page")
+      ? draftPageFromHtml(documentInFrame, body.html)
+      : null;
+    if (draftPage) {
+      state.draftPreview = "measuring";
+      const selected = await selectDraftLayout(version, {
+        sourcePage: draftPage,
+        applyToVisible: false
+      });
+      commitDraftPage(documentInFrame, draftPage, selected, version, contentRevision);
       return;
     }
 

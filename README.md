@@ -45,6 +45,7 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 - [V2.4 当前边界](docs/v2-4-boundaries.md)
 - [V2.4 验收清单](docs/v2-4-acceptance-checklist.md)
+- [V2.4.2 正文预览缓冲设计](docs/plans/2026-07-11-v2-4-2-content-preview-buffering-design.md)
 - [V2.4.1 预览稳定性设计](docs/plans/2026-07-11-v2-4-1-preview-stability-design.md)
 - [V2.4.1 预览稳定性实施计划](docs/plans/2026-07-11-v2-4-1-preview-stability.md)
 - [V2.4 有限排版控制设计](docs/plans/2026-07-11-v2-4-layout-controls-design.md)
@@ -159,7 +160,7 @@ npm run editor
 
 草稿请求有约 300ms 防抖，并且只采用最后一次结果。这样可以实时观察排版，又不会在每次输入时生成 PDF。
 
-调整字号、行高、内容间距或页边距时，编辑器会复用当前预览文档，并在不可见的 A4 克隆上测试自动适配候选；可见简历只应用最终候选一次，滑块也不会在拖动时被重建。修改姓名、经历、技能或项目等内容时仍会加载新的草稿 HTML，因此可能发生一次正常重排；内容预览双缓冲不属于 V2.4.1。
+调整字号、行高、内容间距或页边距时，编辑器会复用当前预览文档，并在不可见的 A4 克隆上测试自动适配候选；可见简历只应用最终候选一次，滑块也不会在拖动时被重建。修改姓名、经历、技能或项目等内容时，新正文同样会先在当前 iframe 的不可见页面中完成测量，再连同最终排版参数一次性替换可见 A4；已有预览不会重新加载 iframe。首次打开尚无可用页面的简历时仍会执行一次正常 HTML 加载。
 
 存在未保存草稿时，刷新、关闭页面或离开编辑器会触发浏览器确认提示。保存成功后不再提示。
 
