@@ -98,6 +98,8 @@ const state = {
   pendingImport: null,
   recoverySnapshots: [],
   selectedRecoverySnapshotId: "",
+  recoveryLoadGeneration: 0,
+  pendingRecoveryRefresh: null,
   pendingDraftPreviewMessage: "",
   message: "",
   messageKind: ""
@@ -551,29 +553,45 @@ function friendlyError(message, url = "") {
   return text || "操作失败。";
 }
 
+function createRequestError(message, url, { code = "", status = 0 } = {}) {
+  const error = new Error(friendlyError(message, url));
+  if (/^[a-z0-9-]{1,64}$/.test(String(code))) {
+    error.code = code;
+  }
+  if (Number.isInteger(status) && status > 0) {
+    error.status = status;
+  }
+  return error;
+}
+
 async function requestJson(url, options = {}) {
   let response;
   try {
     response = await fetch(url, options);
   } catch (error) {
-    throw new Error(friendlyError(error.message, url));
+    throw createRequestError(error.message, url);
   }
 
   const contentType = response.headers.get("content-type") || "";
   if (!contentType.includes("application/json")) {
     const text = (await response.text()).trim();
-    throw new Error(friendlyError(text || `Request failed: ${response.status}`, url));
+    throw createRequestError(text || `Request failed: ${response.status}`, url, {
+      status: response.status
+    });
   }
 
   let body;
   try {
     body = await response.json();
   } catch (error) {
-    throw new Error(friendlyError(error.message, url));
+    throw createRequestError(error.message, url, { status: response.status });
   }
 
   if (!response.ok || !body.ok) {
-    throw new Error(friendlyError(body.error || `Request failed: ${response.status}`, url));
+    throw createRequestError(body.error || `Request failed: ${response.status}`, url, {
+      code: body.code,
+      status: response.status
+    });
   }
   return body;
 }
@@ -772,6 +790,24 @@ function recoveryInvalidLabel(code) {
   return recoveryInvalidLabels[code] || "数据不可用，无法恢复";
 }
 
+const recoveryRestoreErrorMessages = {
+  "snapshot-not-found": "所选恢复数据不存在，已重新读取恢复历史。",
+  "snapshot-invalid": "所选恢复数据不可用，已重新读取恢复历史。",
+  "restore-source-changed": "所选恢复数据已发生变化，已重新读取恢复历史。",
+  "restore-staging-copy-mismatch": "所选恢复数据已发生变化，已重新读取恢复历史。",
+  "restore-staging-invalid": "所选恢复数据不可用，已重新读取恢复历史。",
+  "restore-locked": "当前有其他数据恢复正在进行，请稍后重试。",
+  "restore-cleanup-pending": "上一次恢复仍在清理中，请稍后重试。"
+};
+
+const unavailableRecoveryCodes = new Set([
+  "snapshot-not-found",
+  "snapshot-invalid",
+  "restore-source-changed",
+  "restore-staging-copy-mismatch",
+  "restore-staging-invalid"
+]);
+
 function renderRecoveryDetail(snapshot) {
   if (!snapshot) {
     return "";
@@ -788,21 +824,12 @@ function renderRecoveryDetail(snapshot) {
   `;
 }
 
-function safeRecoveryRequestError(error) {
-  const message = String(error?.message || "").toLowerCase();
-  if (message.includes("changed")) {
-    return "所选恢复数据已发生变化，请重新读取后再试。";
-  }
-  if (message.includes("not found")) {
-    return "所选恢复数据不存在，请重新读取后再试。";
-  }
-  if (message.includes("not valid") || message.includes("invalid")) {
-    return "所选恢复数据不可用，请选择其他记录。";
-  }
-  if (message.includes("in progress") || message.includes("locked")) {
-    return "当前有其他数据操作正在进行，请稍后重试。";
-  }
-  return "操作未完成，请稍后重试。";
+function recoveryRestoreError(error) {
+  const code = String(error?.code || "");
+  return {
+    unavailable: unavailableRecoveryCodes.has(code),
+    message: recoveryRestoreErrorMessages[code] || "恢复操作未完成，请稍后重试。"
+  };
 }
 
 function safeBackupName(value) {
@@ -834,6 +861,25 @@ function renderDataDialog() {
     if (mode === "recovery-error") {
       elements.dataDialogBody.innerHTML = "<p>恢复历史暂时无法读取，当前已保存数据没有发生变化。</p>";
       elements.dataDialogPrimary.textContent = "重试";
+      return;
+    }
+
+    if (mode === "recovery-refresh-error") {
+      elements.dataDialogBody.innerHTML = `
+        ${renderRecoveryDetail(selected)}
+        <p>恢复操作已经完成，无需再次恢复。</p>
+      `;
+      elements.dataDialogPrimary.textContent = "重试刷新";
+      return;
+    }
+
+    if (mode === "recovery-refreshing") {
+      elements.dataDialogBody.innerHTML = `
+        ${renderRecoveryDetail(selected)}
+        <p class="data-dialog-status">数据已恢复，正在刷新界面...</p>
+      `;
+      elements.dataDialogPrimary.textContent = "刷新中";
+      elements.dataDialogPrimary.disabled = true;
       return;
     }
 
@@ -963,11 +1009,13 @@ function closeDataDialog({ cancelPending = true } = {}) {
   if (state.dataDialogBusy) {
     return;
   }
+  state.recoveryLoadGeneration += 1;
   const token = cancelPending ? state.pendingImport?.token : "";
   state.pendingImport = null;
   state.selectedDataFile = null;
   state.recoverySnapshots = [];
   state.selectedRecoverySnapshotId = "";
+  state.pendingRecoveryRefresh = null;
   state.dataDialogMode = "";
   state.dataDialogError = "";
   elements.dataImportInput.value = "";
@@ -1004,7 +1052,7 @@ function requestDataImport() {
   elements.dataImportInput.click();
 }
 
-async function requestDataRecovery() {
+async function requestDataRecovery({ notice = "" } = {}) {
   closeResumeMenus();
   if (state.dirty) {
     setMessage("恢复前请先保存或撤销当前修改", "warning");
@@ -1012,19 +1060,25 @@ async function requestDataRecovery() {
     return;
   }
 
+  const generation = state.recoveryLoadGeneration + 1;
+  state.recoveryLoadGeneration = generation;
   state.recoverySnapshots = [];
   state.selectedRecoverySnapshotId = "";
   openDataDialog("recovery-loading");
   try {
     const body = await requestJson("/api/data/recovery/snapshots");
-    if (state.dataDialogMode !== "recovery-loading") {
+    if (generation !== state.recoveryLoadGeneration
+      || state.dataDialogMode !== "recovery-loading"
+      || !elements.dataDialog.open) {
       return;
     }
     state.recoverySnapshots = Array.isArray(body.snapshots) ? body.snapshots : [];
     state.dataDialogMode = "recovery-list";
-    state.dataDialogError = "";
+    state.dataDialogError = notice;
   } catch (_error) {
-    if (state.dataDialogMode !== "recovery-loading") {
+    if (generation !== state.recoveryLoadGeneration
+      || state.dataDialogMode !== "recovery-loading"
+      || !elements.dataDialog.open) {
       return;
     }
     state.dataDialogMode = "recovery-error";
@@ -1098,6 +1152,40 @@ async function commitDataImport() {
   }
 }
 
+function clearDataRecoveryBusy() {
+  state.dataDialogBusy = false;
+  setBusy("");
+  renderResumeSelector();
+}
+
+async function refreshDataRecoveryUi() {
+  const pending = state.pendingRecoveryRefresh;
+  if (!pending || state.dataDialogBusy || isBusy()) {
+    return;
+  }
+
+  state.dataDialogBusy = true;
+  state.dataDialogMode = "recovery-refreshing";
+  state.dataDialogError = "";
+  renderDataDialog();
+  setBusy("refreshing-recovery");
+  try {
+    await loadSelectedResume({ draftOnly: true });
+  } catch (_error) {
+    state.dataDialogMode = "recovery-refresh-error";
+    state.dataDialogError = "数据已恢复，但界面刷新失败。请重试刷新。";
+    clearDataRecoveryBusy();
+    renderDataDialog();
+    queueMicrotask(() => elements.dataDialogPrimary.focus());
+    return;
+  }
+
+  const recoveryMessage = pending.message;
+  clearDataRecoveryBusy();
+  closeDataDialog({ cancelPending: false });
+  setMessage(recoveryMessage, "ok");
+}
+
 async function commitDataRecovery() {
   const snapshot = selectedRecoverySnapshot();
   if (state.dirty) {
@@ -1115,30 +1203,35 @@ async function commitDataRecovery() {
   state.dataDialogError = "";
   renderDataDialog();
   setBusy("recovering-data");
+  let body;
   try {
-    const body = await requestJson("/api/data/recovery/restore", {
+    body = await requestJson("/api/data/recovery/restore", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ snapshotId: snapshot.id })
     });
-    applyRegistry(body);
-    const recoveryMessage = `恢复完成，当前数据已保留到 ${safeBackupName(body.preRestoreBackup)}`;
-    state.pendingDraftPreviewMessage = recoveryMessage;
-    state.dataDialogBusy = false;
-    closeDataDialog({ cancelPending: false });
-    await loadSelectedResume({ draftOnly: true });
-    setMessage(recoveryMessage, "ok");
   } catch (error) {
     state.pendingDraftPreviewMessage = "";
-    state.dataDialogMode = "recovery-confirm";
-    state.dataDialogError = `恢复失败：${safeRecoveryRequestError(error)}`;
-  } finally {
-    state.dataDialogBusy = false;
-    setBusy("");
-    if (elements.dataDialog.open) {
-      renderDataDialog();
+    const recoveryError = recoveryRestoreError(error);
+    clearDataRecoveryBusy();
+    if (recoveryError.unavailable) {
+      state.selectedRecoverySnapshotId = "";
+      await requestDataRecovery({ notice: `恢复失败：${recoveryError.message}` });
+      return;
     }
+    state.dataDialogMode = "recovery-confirm";
+    state.dataDialogError = `恢复失败：${recoveryError.message}`;
+    renderDataDialog();
+    queueMicrotask(() => elements.dataDialogPrimary.focus());
+    return;
   }
+
+  applyRegistry(body);
+  const recoveryMessage = `恢复完成，当前数据已保留到 ${safeBackupName(body.preRestoreBackup)}`;
+  state.pendingRecoveryRefresh = { message: recoveryMessage };
+  state.pendingDraftPreviewMessage = recoveryMessage;
+  clearDataRecoveryBusy();
+  await refreshDataRecoveryUi();
 }
 
 function setBusy(action) {
@@ -2276,6 +2369,10 @@ elements.dataDialogPrimary.addEventListener("click", () => {
   }
   if (state.dataDialogMode === "recovery-confirm") {
     void commitDataRecovery();
+    return;
+  }
+  if (state.dataDialogMode === "recovery-refresh-error") {
+    void refreshDataRecoveryUi();
     return;
   }
   if (state.dataDialogMode === "recovery-error") {

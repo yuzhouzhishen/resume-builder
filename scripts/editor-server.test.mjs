@@ -3939,6 +3939,69 @@ test("editor recovery center shows loading, load errors, retry, and empty histor
   assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), false);
 });
 
+test("editor recovery center ignores a stale historical data list response after reopen", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const firstResponse = deferred();
+  const secondResponse = deferred();
+  const secondDelivery = deferred();
+  let snapshotRequests = 0;
+  const snapshot = (id, name) => ({
+    id,
+    type: "pre-restore",
+    createdAt: "2026-07-11T08:09:10+08:00",
+    valid: true,
+    resumeCount: 1,
+    activeResumeId: id,
+    activeResumeName: name,
+    resumes: [{ id, name }]
+  });
+  await page.route("**/api/data/recovery/snapshots", async (route) => {
+    const requestNumber = snapshotRequests + 1;
+    snapshotRequests = requestNumber;
+    const payload = await (requestNumber === 1 ? firstResponse.promise : secondResponse.promise);
+    if (requestNumber === 2) {
+      await secondDelivery.promise;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(payload)
+    });
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+
+  const firstRequest = page.waitForRequest((request) => request.url().endsWith("/api/data/recovery/snapshots"));
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  const firstRequestObject = await firstRequest;
+  await page.click("#dataDialogClose");
+
+  const secondRequest = page.waitForRequest((request) => request.url().endsWith("/api/data/recovery/snapshots"));
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await secondRequest;
+  secondResponse.resolve({ ok: true, snapshots: [snapshot("new-snapshot", "新的恢复数据")] });
+  const firstCompleted = page.waitForResponse((response) => response.request() === firstRequestObject);
+  firstResponse.resolve({ ok: true, snapshots: [snapshot("old-snapshot", "旧的恢复数据")] });
+  await firstCompleted;
+  secondDelivery.resolve();
+  await page.waitForFunction(() => document.querySelector("#dataDialogBody")?.textContent?.includes("新的恢复数据"));
+  await page.waitForTimeout(100);
+  const dialogText = await page.textContent("#dataDialog");
+  assert.match(dialogText, /新的恢复数据/);
+  assert.doesNotMatch(dialogText, /旧的恢复数据/);
+  assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), true);
+});
+
 test("editor recovery center lists historical data accessibly and confirms before restore", async (t) => {
   const rootDir = makeApiFixture();
   const app = await startEditorServer({
@@ -4152,12 +4215,12 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
       return;
     }
     await route.fulfill({
-      status: 409,
+      status: 423,
       contentType: "application/json",
       body: JSON.stringify({
         ok: false,
-        code: "restore-source-changed",
-        error: `The selected snapshot changed at ${privateLookingPath}/data.`
+        code: "restore-locked",
+        error: `Misleading transient failure at ${privateLookingPath}/data.`
       })
     });
   });
@@ -4198,6 +4261,7 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
   assert.equal(await page.textContent("#resumeSelectLabel"), "恢复后的简历");
   assert.match(await page.textContent("#statusStrip"), /PDF 待生成/);
   assert.equal(await page.locator("#previewFrame").getAttribute("src"), "about:blank");
+  await page.waitForFunction(() => document.activeElement?.id === "dataManagerButton");
 
   await page.click("#dataManagerButton");
   await page.click("#recoverDataButton");
@@ -4209,10 +4273,10 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
   assert.equal(restoreRequests, 2);
   assert.equal(await page.textContent("#dataDialogPrimary"), "确认恢复");
   assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), false);
-  assert.match(failureText, /所选恢复数据已发生变化/);
+  assert.match(failureText, /其他数据恢复正在进行/);
   assert.match(failureText, /C\+\+ 应届生/);
   assert.equal(failureText.includes(privateLookingPath), false);
-  assert.doesNotMatch(failureText, /The selected|private\/data/);
+  assert.doesNotMatch(failureText, /Misleading transient|private\/data/);
 
   await page.click("#dataDialogPrimary");
   await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("恢复失败"));
@@ -4227,6 +4291,148 @@ test("editor historical data restore is single-flight, reloads drafts, and keeps
   assert.equal(restoreRequests, 3);
   assert.match(await page.textContent("#messageLine"), /恢复前请先保存或撤销当前修改/);
   assert.equal(await page.evaluate(() => document.activeElement?.id), "saveButton");
+});
+
+test("editor recovery center maps unavailable and transient restore codes to safe states", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const privateLookingPath = ["", "Users", "example", "private"].join("/");
+  const snapshot = {
+    id: "coded-error-snapshot",
+    type: "pre-import",
+    createdAt: "2026-07-11T08:09:10+08:00",
+    valid: true,
+    resumeCount: 1,
+    activeResumeId: "cpp",
+    activeResumeName: "错误码测试简历",
+    resumes: [{ id: "cpp", name: "错误码测试简历" }]
+  };
+  let listRequests = 0;
+  let restoreRequests = 0;
+  await page.route("**/api/data/recovery/snapshots", async (route) => {
+    listRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, snapshots: [snapshot] })
+    });
+  });
+  await page.route("**/api/data/recovery/restore", async (route) => {
+    restoreRequests += 1;
+    const unavailable = restoreRequests === 1;
+    await route.fulfill({
+      status: unavailable ? 404 : 423,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: false,
+        code: unavailable ? "snapshot-not-found" : "restore-locked",
+        error: `Wrong English message at ${privateLookingPath}/snapshot.`
+      })
+    });
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.click("[data-snapshot-id='coded-error-snapshot']");
+  await page.click("#dataDialogPrimary");
+  await page.click("#dataDialogPrimary");
+
+  await page.waitForFunction(() => document.querySelector("#dataDialogPrimary")?.textContent === "继续");
+  const unavailableText = await page.textContent("#dataDialog");
+  assert.equal(listRequests, 2);
+  assert.equal(restoreRequests, 1);
+  assert.match(unavailableText, /所选恢复数据不存在/);
+  assert.equal(unavailableText.includes(privateLookingPath), false);
+  assert.doesNotMatch(unavailableText, /Wrong English message/);
+  assert.equal(await page.locator(".recovery-snapshot-row.is-selected").count(), 0);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), true);
+
+  await page.click("[data-snapshot-id='coded-error-snapshot']");
+  await page.click("#dataDialogPrimary");
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("其他数据恢复正在进行"));
+  const transientText = await page.textContent("#dataDialog");
+  assert.equal(restoreRequests, 2);
+  assert.equal(transientText.includes(privateLookingPath), false);
+  assert.equal(await page.locator("#dataDialogPrimary").isDisabled(), false);
+  assert.equal(await page.locator(".recovery-snapshot-detail").count(), 1);
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("其他数据恢复正在进行"));
+  assert.equal(restoreRequests, 3);
+});
+
+test("editor recovery center retries only UI refresh after a committed restore", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const snapshot = {
+    id: "refresh-retry-snapshot",
+    type: "pre-restore",
+    createdAt: "2026-07-11T08:09:10+08:00",
+    valid: true,
+    resumeCount: 1,
+    activeResumeId: "cpp",
+    activeResumeName: "刷新重试简历",
+    resumes: [{ id: "cpp", name: "刷新重试简历" }]
+  };
+  let restoreCommitted = false;
+  let restoreRequests = 0;
+  let refreshFailures = 0;
+  await page.route("**/api/data/recovery/snapshots", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify({ ok: true, snapshots: [snapshot] })
+  }));
+  await page.route("**/api/data/recovery/restore", async (route) => {
+    restoreRequests += 1;
+    restoreCommitted = true;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        activeId: "cpp",
+        resumes: [{ id: "cpp", name: "恢复后简历", file: "resumes/cpp.yaml" }],
+        preRestoreBackup: "resume-data.pre-restore-20260711-080910",
+        generation: "needs generate"
+      })
+    });
+  });
+  await page.route("**/api/resume?*", async (route) => {
+    if (restoreCommitted && refreshFailures === 0) {
+      refreshFailures += 1;
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: false, code: "refresh-failed", error: "Synthetic refresh failure." })
+      });
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.click("[data-snapshot-id='refresh-retry-snapshot']");
+  await page.click("#dataDialogPrimary");
+  await page.click("#dataDialogPrimary");
+
+  await page.waitForFunction(() => document.querySelector("#dataDialogPrimary")?.textContent === "重试刷新");
+  assert.equal(restoreRequests, 1);
+  assert.equal(await page.locator("#dataDialog").evaluate((dialog) => dialog.open), true);
+  assert.match(await page.textContent("#dataDialog"), /数据已恢复.*界面刷新失败/);
+  assert.equal(await page.evaluate(() => document.activeElement?.id), "dataDialogPrimary");
+
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => !document.querySelector("#dataDialog")?.open);
+  await page.waitForFunction(() => document.activeElement?.id === "dataManagerButton");
+  assert.equal(restoreRequests, 1);
+  assert.match(await page.textContent("#messageLine"), /恢复完成/);
 });
 
 test("editor recovery center preserves UI-driven pending import cancellation", async (t) => {
