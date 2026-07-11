@@ -2,7 +2,7 @@
 
 Date: 2026-07-11
 
-Status: Approved design, not yet implemented.
+Status: Implemented and verified on 2026-07-11.
 
 ## Summary
 
@@ -15,7 +15,7 @@ The feature extends the existing single template. It does not add template selec
 - Keep automatic one-page A4 fitting as the default.
 - Let every resume store independent preferred layout settings.
 - Expose only bounded global typography, spacing and margin controls.
-- Preserve the current `normal -> compact -> tight` fitting capability.
+- Preserve and generalize the previous `normal -> compact -> tight` one-page fitting capability.
 - Keep draft preview and formal PDF generation on the same candidate-building rules.
 - Report the effective values and total overflow without silently rewriting YAML.
 - Preserve all current multi-resume, backup, import/export, recovery and privacy behavior.
@@ -65,7 +65,7 @@ The new fields store preferred values, not the effective values selected by auto
 
 Intermediate values linearly interpolate each spacing variable independently. This is necessary because the current item, section and experience gaps do not shrink by one common percentage.
 
-Old YAML containing only `layout.sectionOrder` remains valid. Missing new fields use `auto`, `10.8`, `1.38`, `67` and `normal`. Loading an old resume does not write files. The full fields are materialized only when that resume is explicitly saved after a layout edit.
+Old YAML containing only `layout.sectionOrder` remains valid. Missing new fields use `auto`, `10.8`, `1.38`, `67` and `normal`. Loading an old resume does not write files. The editor materializes defaults in its draft state; they are written only on the next explicit save of that resume.
 
 Resume duplication, backups, package export/import and whole-data recovery naturally carry these settings because they already copy or replace the resume YAML.
 
@@ -155,10 +155,10 @@ The existing top-level entries remain two:
 
 The layout panel contains, in order:
 
-1. `自动适配 / 固定排版` segmented control.
+1. `自动适配 / 固定参数` segmented control.
 2. Font size slider with numeric stepper.
 3. Line-height slider with numeric stepper.
-4. Content compactness slider with `最紧 / 紧凑 / 标准 / 宽松` anchors.
+4. Content compactness slider with `紧凑 / 较紧 / 标准 / 宽松` anchors.
 5. `窄 / 标准 / 宽` margin segmented control.
 6. Restore-default command.
 7. Existing section order controls.
@@ -207,3 +207,7 @@ Manual acceptance uses fictional data in an external temporary data root. It che
 ## Delivery Boundaries
 
 V2.4 is complete when old resumes open unchanged, every resume can independently save bounded settings, draft and formal fitting agree, overflowing fixed layouts cannot generate partial output, existing tight resumes retain their one-page capability, all tests and privacy checks pass, and desktop plus narrow visual acceptance shows no clipped controls or A4 content.
+
+## Implementation Result
+
+The implementation uses `scripts/layout-settings.mjs` as the single candidate and CSS-variable source for the preview API and formal generator. Automated privacy, editor, rendering and generation suites pass in UTC. Manual acceptance used an external fictional data root and verified old YAML, preferred auto fitting, every auto compression phase, fixed fitting, fixed overflow, standard one-page A4 PDFs, desktop and narrow editor geometry, draft/formal metadata agreement and click-to-edit behavior.

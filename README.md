@@ -25,7 +25,7 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 1. 在左侧工具栏选择要编辑的简历；`+` 可复制当前简历或从样例新建，`…` 可重命名或删除。
 2. 在右侧 `内容编辑` 里修改基本信息、照片、实习经历、专业技能、项目经历。
-3. 在 `排版顺序` 里调整实习经历、专业技能、项目经历的显示顺序。
+3. 在 `排版设置` 里选择自动或固定模式，调整有限的字号、行高、间距、页边距和正文模块顺序。
 4. 停止输入约 300ms 后，左侧自动更新草稿预览。
 5. 点 `保存`，或按 `Cmd/Ctrl + S`，内容写回数据目录中的当前 YAML 并创建独立备份。
 6. 点 `生成 PDF`，在数据目录中重新生成当前简历的 PDF、PNG 和独立 HTML 预览。
@@ -43,6 +43,8 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 ## 当前文档
 
+- [V2.4 当前边界](docs/v2-4-boundaries.md)
+- [V2.4 验收清单](docs/v2-4-acceptance-checklist.md)
 - [V2.4 有限排版控制设计](docs/plans/2026-07-11-v2-4-layout-controls-design.md)
 - [V2.4 有限排版控制实施计划](docs/plans/2026-07-11-v2-4-layout-controls.md)
 - [V2.3 数据恢复边界](docs/v2-3-boundaries.md)
@@ -162,7 +164,9 @@ npm run editor
 右侧编辑器分成两层：
 
 - `内容编辑`：基本信息、照片、实习经历、专业技能、项目经历。
-- `排版顺序`：调整简历 section 的输出顺序。
+- `排版设置`：设置自动/固定适配、正文字号、行高、内容间距、页边距和简历 section 的输出顺序。
+
+自动模式从当前偏好开始，依次收紧内容间距、页边距、行高和字号，最低只到 `10.2pt / 1.25 / 0 / narrow`，不会无限缩小。固定模式只使用指定参数，溢出时允许保存 YAML，但会阻止生成新的 PDF。
 
 ## 多简历文件模型
 
@@ -236,6 +240,11 @@ layout:
     - internships
     - skills
     - projects
+  mode: auto
+  fontSizePt: 10.8
+  lineHeight: 1.38
+  spacingLevel: 67
+  marginPreset: normal
 skills: []
 internships: []
 projects: []
@@ -248,6 +257,16 @@ projects: []
 - `projects`
 
 每个 key 必须出现一次。
+
+排版参数按每份简历独立保存：
+
+- `mode`：`auto` 或 `fixed`。
+- `fontSizePt`：`10.2-11.2`，步长 `0.1pt`。
+- `lineHeight`：`1.25-1.42`，步长 `0.01`。
+- `spacingLevel`：整数 `0-100`；`0 / 50 / 67 / 100` 分别对应紧凑、较紧、标准、宽松锚点，不是百分比。
+- `marginPreset`：`narrow`、`normal` 或 `wide`。
+
+旧 YAML 不含这些字段时继续有效，并使用默认值 `auto / 10.8 / 1.38 / 67 / normal`。
 
 ## 照片
 
@@ -295,6 +314,8 @@ npm run ci
 - `预览更新中`：正在验证和渲染当前草稿。
 - `草稿预览`：左侧显示当前未保存内容，尚未写入 YAML。
 - `草稿预览失败`：当前草稿暂时无法渲染，左侧保留上一次可用预览。
+- `A4 待测量`：当前内容或排版尚未得到可用测量结果。
+- `超出 A4 Npx`：所有自动候选或当前固定参数仍溢出；可以保存草稿，但不能生成新 PDF。
 - `PDF 待生成`：内容已经保存到当前 YAML，但还没有重新生成正式输出。
 - `预览已更新`：当前预览和最近一次生成结果一致。
 - `保存中`：正在写入数据目录中的当前 YAML，操作按钮会临时禁用，避免重复点击。
@@ -313,7 +334,7 @@ macOS 使用 `Cmd + S`，Windows/Linux 使用 `Ctrl + S`。快捷键调用的仍
 
 ### 生成失败，提示一页放不下怎么办？
 
-当前固定一页标准 A4。生成器会依次尝试 `normal -> compact -> tight` 三档密度。如果 `tight` 仍放不下，会报 overflow。通常需要缩短最长 section，或者减少 1-2 条 bullet。
+当前固定一页标准 A4。自动模式会在有限范围内依次压缩间距、页边距、行高和字号；达到 `10.2pt / 1.25 / 0 / narrow` 后仍放不下就会报告 overflow。可以缩短最长 section、减少 1-2 条 bullet，或在允许范围内调整偏好。固定模式不会自动压缩。
 
 ### bullet 里有冒号会不会坏？
 
@@ -355,7 +376,7 @@ npm run editor
 - 不导出 Word。
 - 不支持多模板。
 - 不做 AI 改写。
-- 自动适配只调整密度，不会删除或重写内容。
+- 自动适配只调整有限的全局字号、行高、间距和页边距，不会删除或重写内容。
 - 实时草稿预览不自动保存，也不自动生成 PDF。
 
-更完整的边界说明见 [docs/v2-boundaries.md](docs/v2-boundaries.md)。
+更完整的当前边界说明见 [docs/v2-4-boundaries.md](docs/v2-4-boundaries.md)。
