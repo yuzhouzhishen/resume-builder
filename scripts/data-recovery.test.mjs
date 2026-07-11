@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   renameSync,
   rmSync,
@@ -166,6 +167,30 @@ test("preserves an existing pre-restore timestamp path and uses the next suffix"
     readFileSync(path.join(`${reservedBackup}-2`, "assets/photo.svg"), "utf8"),
     "<svg>official-before</svg>"
   );
+});
+
+test("treats a dangling pre-restore backup path as occupied", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const reservedBackup = `${dataRoot}.pre-restore-20260711-080910`;
+  const missingTarget = path.join(parent, "missing-backup-target");
+  symlinkSync(missingTarget, reservedBackup, process.platform === "win32" ? "junction" : "dir");
+  const reservedIdentity = lstatSync(reservedBackup);
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "dangling-backup-token"
+  });
+
+  const result = manager.restore(snapshotId(source.basename));
+
+  assert.equal(result.preRestoreBackup, `${path.basename(reservedBackup)}-2`);
+  assert.equal(lstatSync(reservedBackup).isSymbolicLink(), true);
+  assert.equal(lstatSync(reservedBackup).dev, reservedIdentity.dev);
+  assert.equal(lstatSync(reservedBackup).ino, reservedIdentity.ino);
+  assert.equal(readlinkSync(reservedBackup), missingTarget);
+  assert.equal(existsSync(missingTarget), false);
+  assert.equal(existsSync(`${reservedBackup}-2`), true);
 });
 
 test("recovery lock blocks another manager before restore path selection", (t) => {
@@ -784,6 +809,47 @@ test("restore quarantines a failed final publication uniquely and restores the o
   assert.equal(manager.isRestoring(), false);
 });
 
+test("restore quarantines beside a dangling path without changing the symlink", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const quarantineRoot = `${dataRoot}.failed-restore-dangling-quarantine-token`;
+  const nextQuarantineRoot = `${quarantineRoot}-2`;
+  const missingTarget = path.join(parent, "missing-quarantine-target");
+  symlinkSync(missingTarget, quarantineRoot, process.platform === "win32" ? "junction" : "dir");
+  const quarantineIdentity = lstatSync(quarantineRoot);
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "dangling-quarantine-token",
+    validate(rootDir) {
+      if (rootDir === dataRoot) {
+        throw new Error(`final validation failed at ${parent}`);
+      }
+      return validateDataRoot(rootDir);
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.code, "restore-final-validation-failed");
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(nextQuarantineRoot, "assets/photo.svg"), "utf8"),
+    "<svg>selected-source</svg>"
+  );
+  assert.equal(lstatSync(quarantineRoot).isSymbolicLink(), true);
+  assert.equal(lstatSync(quarantineRoot).dev, quarantineIdentity.dev);
+  assert.equal(lstatSync(quarantineRoot).ino, quarantineIdentity.ino);
+  assert.equal(readlinkSync(quarantineRoot), missingTarget);
+  assert.equal(existsSync(missingTarget), false);
+  assert.equal(existsSync(source.rootDir), true);
+});
+
 test("restore preserves current and backup copies when quarantine rename fails", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
@@ -1115,6 +1181,37 @@ test("restore rejects unsafe tokens and allocates beside an existing staging dir
   assert.deepEqual(removeCalls, []);
   assert.equal(existsSync(nextStagingRoot), false);
   assert.equal(existsSync(dataRoot), true);
+  assert.equal(existsSync(source.rootDir), true);
+});
+
+test("restore allocates beside a dangling staging symlink without changing it", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-dangling-token`);
+  const nextStagingRoot = `${stagingRoot}-2`;
+  const missingTarget = path.join(parent, "missing-staging-target");
+  symlinkSync(missingTarget, stagingRoot, process.platform === "win32" ? "junction" : "dir");
+  const stagingIdentity = lstatSync(stagingRoot);
+  const copyTargets = [];
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    tokenFactory: () => "dangling-token",
+    copy(sourceRoot, targetRoot, options) {
+      copyTargets.push(targetRoot);
+      cpSync(sourceRoot, targetRoot, options);
+    }
+  });
+
+  const result = manager.restore(snapshotId(source.basename));
+
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.deepEqual(copyTargets, [nextStagingRoot]);
+  assert.equal(lstatSync(stagingRoot).isSymbolicLink(), true);
+  assert.equal(lstatSync(stagingRoot).dev, stagingIdentity.dev);
+  assert.equal(lstatSync(stagingRoot).ino, stagingIdentity.ino);
+  assert.equal(readlinkSync(stagingRoot), missingTarget);
+  assert.equal(existsSync(missingTarget), false);
+  assert.equal(existsSync(nextStagingRoot), false);
   assert.equal(existsSync(source.rootDir), true);
 });
 

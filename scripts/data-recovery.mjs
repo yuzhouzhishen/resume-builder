@@ -3,7 +3,6 @@ import {
   closeSync,
   constants,
   cpSync,
-  existsSync,
   fstatSync,
   linkSync,
   lstatSync,
@@ -697,14 +696,25 @@ function formatTimestamp(date) {
 }
 
 function findAvailablePath(basePath) {
-  if (!existsSync(basePath)) {
-    return basePath;
-  }
+  let candidatePath = basePath;
   let suffix = 2;
-  while (existsSync(`${basePath}-${suffix}`)) {
+  while (pathIsOccupied(candidatePath)) {
+    candidatePath = `${basePath}-${suffix}`;
     suffix += 1;
   }
-  return `${basePath}-${suffix}`;
+  return candidatePath;
+}
+
+function pathIsOccupied(candidatePath) {
+  try {
+    lstatSync(candidatePath);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 function validateToken(token) {
