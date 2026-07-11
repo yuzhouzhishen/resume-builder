@@ -4460,12 +4460,15 @@ test("editor recovery center blocks retry when restore requires manual recovery"
   }));
   await page.route("**/api/data/recovery/restore", async (route) => {
     restoreRequests += 1;
+    const code = restoreRequests === 1
+      ? "restore-rollback-failed"
+      : "restore-quarantine-failed";
     await route.fulfill({
       status: 500,
       contentType: "application/json",
       body: JSON.stringify({
         ok: false,
-        code: "restore-rollback-failed",
+        code,
         error: `Manual recovery detail at ${privateLookingPath}/snapshot.`
       })
     });
@@ -4492,6 +4495,28 @@ test("editor recovery center blocks retry when restore requires manual recovery"
   await page.waitForFunction(() => document.activeElement?.id === "dataDialogClose");
   await page.locator("#dataDialogPrimary").evaluate((button) => button.click());
   assert.equal(restoreRequests, 1);
+  await page.click("#dataDialogClose");
+  await page.waitForFunction(() => !document.querySelector("#dataDialog")?.open);
+
+  await page.click("#dataManagerButton");
+  await page.click("#recoverDataButton");
+  await page.click("[data-snapshot-id='manual-recovery-snapshot']");
+  await page.click("#dataDialogPrimary");
+  await page.click("#dataDialogPrimary");
+  await page.waitForFunction(() => document.querySelector("#dataDialogError")?.textContent?.includes("异常数据无法隔离"));
+
+  const quarantineText = await page.textContent("#dataDialog");
+  assert.equal(restoreRequests, 2);
+  assert.match(quarantineText, /需要人工处理/);
+  assert.match(quarantineText, /停止继续恢复/);
+  assert.equal(quarantineText.includes(privateLookingPath), false);
+  assert.equal(await page.locator("#dataDialogPrimary").isHidden(), true);
+  assert.equal(await page.locator("#dataDialogCancel").isDisabled(), false);
+  await page.waitForFunction(() => document.activeElement?.id === "dataDialogClose");
+  await page.locator("#dataDialogPrimary").evaluate((button) => button.click());
+  assert.equal(restoreRequests, 2);
+  await page.click("#dataDialogCancel");
+  await page.waitForFunction(() => !document.querySelector("#dataDialog")?.open);
 });
 
 test("editor recovery center retries only UI refresh after a committed restore", async (t) => {
