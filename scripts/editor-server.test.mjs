@@ -192,15 +192,17 @@ async function installControlledLayoutMeasurements(page, overflowByBodySize) {
   await page.addInitScript((overflowMap) => {
     const original = Element.prototype.getBoundingClientRect;
     Element.prototype.getBoundingClientRect = function controlledLayoutRect() {
-      if (this.id === "resume-page") {
+      const measurementPage = this.closest?.("#resume-page, [data-layout-measurement-page]");
+      if (this.id === "resume-page" || this.hasAttribute?.("data-layout-measurement-page")) {
         return {
           x: 0, y: 0, top: 0, left: 0,
           right: 794, bottom: 1123, width: 794, height: 1123,
           toJSON() { return this; }
         };
       }
-      if (this.closest?.("#resume-page")) {
-        const bodySize = document.documentElement.style.getPropertyValue("--body-size").trim();
+      if (measurementPage) {
+        const bodySize = measurementPage.parentElement?.style.getPropertyValue("--body-size").trim()
+          || document.documentElement.style.getPropertyValue("--body-size").trim();
         const overflow = Number(overflowMap[bodySize] || 0);
         if (this.matches("[data-path='profile.name']")) {
           window.parent.__layoutMeasurements ||= [];
@@ -215,6 +217,30 @@ async function installControlledLayoutMeasurements(page, overflowByBodySize) {
       return original.call(this);
     };
   }, overflowByBodySize);
+}
+
+async function installVisibleLayoutTracking(page) {
+  await page.addInitScript(() => {
+    if (window === window.top) {
+      return;
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      const root = document.documentElement;
+      const record = () => {
+        const bodySize = root.style.getPropertyValue("--body-size").trim();
+        if (!bodySize) {
+          return;
+        }
+        window.parent.__visibleLayoutSizes ||= [];
+        window.parent.__visibleLayoutSizes.push(bodySize);
+      };
+      new MutationObserver(record).observe(root, {
+        attributes: true,
+        attributeFilter: ["style"]
+      });
+    });
+  });
 }
 
 const validResume = {
@@ -1136,6 +1162,7 @@ test("draft preview applies layout candidates in order and selects the first A4 
     "11.2pt": 24,
     "10.8pt": 0
   });
+  await installVisibleLayoutTracking(page);
   await page.route("**/api/preview", async (route) => {
     const body = route.request().postDataJSON();
     await route.fulfill({
@@ -1169,7 +1196,69 @@ test("draft preview applies layout candidates in order and selects the first A4 
   });
 
   assert.deepEqual(await page.evaluate(() => window.__layoutMeasurements), ["11.2pt", "10.8pt"]);
+  assert.equal(await page.evaluate(() => window.__visibleLayoutSizes.includes("11.2pt")), false);
+  assert.equal(await page.evaluate(() => window.__visibleLayoutSizes.at(-1)), "10.8pt");
   assert.match(await page.textContent("#statusStrip"), /自动.*10\.8pt.*行距 1\.32.*较紧.*标准边距/);
+});
+
+test("layout-only drafts reuse the preview document while content drafts reload it", async (t) => {
+  const rootDir = makeApiFixture();
+  const resume = structuredClone(validResume);
+  resume.layout = {
+    mode: "fixed",
+    fontSizePt: 10.8,
+    lineHeight: 1.38,
+    spacingLevel: 67,
+    marginPreset: "normal",
+    sectionOrder: ["internships", "skills", "projects"]
+  };
+  saveResumeYaml(resumeYamlPath(rootDir), resume);
+  writeFileSync(previewHtmlPath(rootDir), renderResumeHtml(resume, {
+    density: "normal",
+    cssPath: "/templates/resume.css"
+  }));
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-area='layout']");
+  await waitForPreviewInteractive(page);
+  await page.click("[data-area='layout']");
+  await page.locator("#previewFrame").evaluate((iframe) => {
+    window.__trackedPreviewDocument = iframe.contentDocument;
+    window.__trackedPreviewLoads = 0;
+    iframe.addEventListener("load", () => {
+      window.__trackedPreviewLoads += 1;
+    });
+  });
+
+  await page.locator("input[data-layout-field='fontSizePt']").fill("10.9");
+  await page.waitForFunction(() => {
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return status.includes("10.9pt") && status.includes("草稿预览");
+  });
+  assert.deepEqual(await page.locator("#previewFrame").evaluate((iframe) => ({
+    sameDocument: iframe.contentDocument === window.__trackedPreviewDocument,
+    loadCount: window.__trackedPreviewLoads
+  })), {
+    sameDocument: true,
+    loadCount: 0
+  });
+
+  await page.click("[data-area='content']");
+  await page.fill("[data-path='profile.name']", "内容变更仍需重载");
+  await page.waitForFunction(() => {
+    const iframe = document.querySelector("#previewFrame");
+    return iframe?.contentDocument?.querySelector("[data-path='profile.name']")?.textContent?.includes("内容变更仍需重载");
+  });
+  assert.deepEqual(await page.locator("#previewFrame").evaluate((iframe) => ({
+    sameDocument: iframe.contentDocument === window.__trackedPreviewDocument,
+    loadCount: window.__trackedPreviewLoads
+  })), {
+    sameDocument: false,
+    loadCount: 1
+  });
 });
 
 test("fixed draft overflow allows saving but gates generation until the draft fits", async (t) => {
@@ -1376,6 +1465,26 @@ test("editor exposes bounded layout settings and previews changed values", async
   assert.equal(await page.locator("[data-action='step-layout'][data-layout-field='fontSizePt'][data-direction='1']").getAttribute("aria-label"), "增大正文字号");
 
   await page.click("[data-action='set-layout-mode'][data-layout-value='fixed']");
+  await page.locator("input[data-layout-field='fontSizePt']").evaluate((input) => {
+    window.__trackedLayoutRange = input;
+    input.focus();
+    input.value = "10.9";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  assert.deepEqual(await page.evaluate(() => {
+    const input = document.querySelector("input[data-layout-field='fontSizePt']");
+    return {
+      sameNode: input === window.__trackedLayoutRange,
+      focused: document.activeElement === input,
+      output: document.querySelector("[data-layout-output='fontSizePt']")?.textContent,
+      valueText: input?.getAttribute("aria-valuetext")
+    };
+  }), {
+    sameNode: true,
+    focused: true,
+    output: "10.9pt",
+    valueText: "10.9pt"
+  });
   await page.locator("input[data-layout-field='fontSizePt']").fill("11.2");
   await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("未保存"));
   assert.equal(await page.locator("[data-action='step-layout'][data-layout-field='fontSizePt'][data-direction='1']").isDisabled(), true);
