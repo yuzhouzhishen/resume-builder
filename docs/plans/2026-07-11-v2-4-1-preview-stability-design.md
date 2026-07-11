@@ -2,7 +2,7 @@
 
 Date: 2026-07-11
 
-Status: Approved for implementation.
+Status: Implemented on `feature/v2.4.1-preview-stability`.
 
 ## Problem
 
@@ -68,3 +68,8 @@ Segmented controls, step buttons and reset may continue to rerender the compact 
 - A range element retains identity and focus while its value changes.
 - Content edits still load updated HTML and preserve click-to-edit behavior.
 
+## Implementation Result
+
+V2.4.1 implements content revision tracking, offscreen candidate measurement and in-place range synchronization without changing the preview API or persisted layout schema. Automated browser coverage verifies stable iframe identity for layout-only drafts, a full reload for content drafts, hidden intermediate candidates, retained range focus and stale-response protection.
+
+Full content-edit double buffering remains deferred. A content change can still cause one iframe load and one final reflow because the HTML structure itself may have changed.
