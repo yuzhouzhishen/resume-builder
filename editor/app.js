@@ -796,8 +796,7 @@ const recoveryRestoreErrorMessages = {
   "restore-source-changed": "所选恢复数据已发生变化，已重新读取恢复历史。",
   "restore-staging-copy-mismatch": "所选恢复数据已发生变化，已重新读取恢复历史。",
   "restore-staging-invalid": "所选恢复数据不可用，已重新读取恢复历史。",
-  "restore-locked": "当前有其他数据恢复正在进行，请稍后重试。",
-  "restore-cleanup-pending": "上一次恢复仍在清理中，请稍后重试。"
+  "restore-locked": "当前编辑器中已有数据恢复正在进行，请稍后重试。"
 };
 
 const unavailableRecoveryCodes = new Set([

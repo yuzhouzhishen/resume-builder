@@ -42,12 +42,12 @@ const DATA_RECOVERY_PUBLIC_ERRORS = new Map([
   ["snapshot-not-found", [404, "Snapshot is no longer available."]],
   ["snapshot-invalid", [409, "Snapshot is not valid for restore."]],
   ["restore-staging-exists", [409, "Restore staging is already in use."]],
+  ["restore-staging-reservation-failed", [500, "A restore staging location could not be reserved."]],
   ["restore-staging-identity-lost", [409, "Restore staging ownership changed during restore."]],
   ["restore-source-changed", [409, "The selected snapshot changed during restore."]],
   ["restore-staging-copy-mismatch", [409, "The staged snapshot does not match the selected snapshot."]],
   ["restore-staging-invalid", [409, "The staged snapshot is not valid for restore."]],
   ["restore-locked", [423, "Another data restore is in progress."]],
-  ["restore-cleanup-pending", [423, "A previous restore cleanup is still pending."]],
   ["snapshot-scan-failed", [500, "Snapshots could not be scanned."]],
   ["invalid-restore-token", [500, "Restore token is invalid."]],
   ["restore-token-failed", [500, "A restore token could not be created."]],
@@ -58,11 +58,7 @@ const DATA_RECOVERY_PUBLIC_ERRORS = new Map([
   ["restore-rollback-failed", [500, "The previous data could not be restored. Manual recovery is required."]],
   ["restore-publish-failed", [500, "Restore publication failed. The previous data was restored."]],
   ["restore-quarantine-failed", [500, "Failed restore data could not be quarantined. Manual recovery is required."]],
-  ["restore-final-validation-failed", [500, "Restored data failed final validation. The previous data was restored."]],
-  ["restore-cleanup-failed", [500, "Temporary restore staging could not be cleaned up."]],
-  ["restore-lock-release-failed", [500, "The recovery transaction lock could not be released."]],
-  ["restore-lock-token-failed", [500, "A recovery transaction lock token could not be created."]],
-  ["restore-lock-acquire-failed", [500, "The recovery transaction lock could not be acquired."]]
+  ["restore-final-validation-failed", [500, "Restored data failed final validation. The previous data was restored."]]
 ]);
 const EXAMPLES = [
   { id: "cpp", label: "C++", path: "examples/cpp.yaml" },

@@ -6,6 +6,8 @@
 
 **Architecture:** A new `scripts/data-recovery.mjs` module owns allowlisted snapshot discovery, opaque IDs, validation, staging copies, atomic replacement, and rollback. `scripts/editor-server.mjs` exposes thin list/restore endpoints and generalizes the existing import mutation gate into a shared whole-data replacement gate; the vanilla editor extends its existing data dialog with list and confirmation states. All destructive tests use temporary data roots and injected filesystem functions, never the user's configured private directory.
 
+**Implemented concurrency and retention contract:** One editor process may use a given `dataRoot`. The server acquires its in-process whole-data replacement gate before calling the recovery manager and holds it through discovery, staging, validation, publication, rollback, and response handling. V2.3 creates no cross-process lock file and has no stale-lock or manual lock-cleanup flow. Failed or unpublished staging directories are preserved instead of recursively auto-deleted and may accumulate for later inspection.
+
 **Tech Stack:** Node.js ESM, Node standard filesystem and crypto APIs, existing registry/YAML validation, built-in HTTP server, vanilla HTML/CSS/JavaScript, Node test runner, Playwright.
 
 ---
@@ -122,14 +124,14 @@ Cover:
 - an existing `.pre-restore-<timestamp>` causes a `-2` suffix rather than overwrite;
 - an unknown ID and a candidate removed or invalidated after listing are rejected without writes;
 - `isRestoring()` is true only during the injected transaction;
-- `dispose()` removes only an owned unpublished staging directory;
+- `dispose()` only releases in-process ownership state and does not delete unpublished staging;
 - a second restore from the same snapshot succeeds because the source snapshot remains.
 
 **Step 3: Write failing rollback tests**
 
-Inject `copy`, `rename`, `validate` and `remove` operations to prove:
+Inject `copy`, `rename` and `validate` operations to prove:
 
-- copy or staging validation failure leaves current data and all snapshots untouched;
+- copy or staging validation failure leaves current data and all snapshots untouched and preserves unpublished staging;
 - publishing the staging directory failing after the first rename restores the old root;
 - final validation failure moves the failed publication to a unique `.failed-restore-<token>` path and restores the old root;
 - failure to restore the old root reports a high-signal error and never deletes either surviving directory;
@@ -160,7 +162,7 @@ export function createDataRecoveryManager(options) {
 }
 ```
 
-`restore()` must rescan snapshots, copy the source to `.<basename>.restore-<token>` in the same parent directory, validate the copy, reserve a unique pre-restore path, and use two atomic renames. Validate again after publication. Roll back or quarantine exactly as specified in the design; clear owned staging in `finally` only when it is not the official root.
+`restore()` must rescan snapshots, copy the source to `.<basename>.restore-<token>` in the same parent directory, validate the copy, reserve a unique pre-restore path, and use two atomic renames. Validate again immediately before publication and after publication. Roll back or quarantine exactly as specified in the design; clear only in-process ownership state in `finally` and preserve unpublished staging on disk.
 
 **Step 6: Run all recovery tests and verify GREEN**
 
@@ -204,6 +206,7 @@ Inject import and recovery managers to prove:
 - import commit and restore cannot start together;
 - while either replacement is active, new official mutations and data export are rejected;
 - a failed request releases the pending replacement gate;
+- the server acquires the replacement gate before calling the manager and holds it through the complete restore, including staging;
 - server close disposes both managers;
 - ordinary snapshot listing does not acquire the destructive gate.
 
@@ -409,9 +412,10 @@ Create recovery fixtures through test-safe import/restore flows, then check the 
 Use `superpowers:requesting-code-review` and specifically review:
 
 - no client-controlled paths reach filesystem operations;
-- no recursive removal can target official or historical data;
+- no recursive automatic removal targets official, historical, failed or unpublished staging data;
 - all restore failures preserve at least one valid current copy;
 - import and restore share one exclusive replacement gate;
+- one editor process is the supported limit for each `dataRoot`; no cross-process lock file or stale-lock cleanup is claimed;
 - no API or tracked fixture contains private absolute paths or real resume data.
 
 **Step 5: Inspect the final diff and Git status**

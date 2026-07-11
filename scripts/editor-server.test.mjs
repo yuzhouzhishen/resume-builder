@@ -3052,6 +3052,60 @@ test("data recovery APIs map request, method, and manager errors safely", async 
     code: staleError.code
   });
 
+  const currentAndRetiredCodes = [
+    {
+      code: "restore-staging-reservation-failed",
+      statusCode: 500,
+      expected: {
+        ok: false,
+        error: "A restore staging location could not be reserved.",
+        code: "restore-staging-reservation-failed"
+      }
+    },
+    {
+      code: "restore-cleanup-failed",
+      statusCode: 500,
+      expected: {
+        ok: false,
+        error: "Data recovery failed.",
+        code: "recovery-failed"
+      }
+    },
+    {
+      code: "restore-lock-acquire-failed",
+      statusCode: 500,
+      expected: {
+        ok: false,
+        error: "Data recovery failed.",
+        code: "recovery-failed"
+      }
+    }
+  ];
+  for (const scenario of currentAndRetiredCodes) {
+    const codedError = new Error(`Private detail at ${dataRoot}`);
+    codedError.statusCode = scenario.statusCode;
+    codedError.code = scenario.code;
+    const codedApp = await startEditorServer({
+      preferredPort: 0,
+      maxPort: 0,
+      rootDir: makeApiFixture(),
+      dataRecoveryManager: stubRecoveryManager({
+        restore() {
+          throw codedError;
+        }
+      }),
+      log: false
+    });
+    t.after(async () => codedApp.close());
+    const codedResponse = await fetch(`${codedApp.url}/api/data/recovery/restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ snapshotId: "b".repeat(64) })
+    });
+    assert.equal(codedResponse.status, scenario.statusCode, scenario.code);
+    assert.deepEqual(await codedResponse.json(), scenario.expected, scenario.code);
+  }
+
   const leakedPath = path.join(dataRoot, "private", "snapshot");
   const unexpectedManager = stubRecoveryManager({
     list() {
