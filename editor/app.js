@@ -118,6 +118,10 @@ const state = {
   selectedPreviewPath: "",
   previewSource: "generated",
   draftPreview: "idle",
+  contentRevision: 0,
+  renderedContentRevision: null,
+  pendingPreviewContentRevision: null,
+  pendingPreviewVersion: null,
   pendingDelete: null,
   dataDialogMode: "",
   dataDialogBusy: false,
@@ -246,7 +250,10 @@ function isPreviewStale() {
   return state.dirty || state.generation === "needs generate";
 }
 
-function markDirty() {
+function markDirty(changeKind = "content") {
+  if (changeKind === "content") {
+    state.contentRevision += 1;
+  }
   state.dirty = true;
   state.saveState = "unsaved";
   state.generation = "needs generate";
@@ -268,6 +275,9 @@ function refreshGeneratedPreview() {
   }
   cancelDraftPreview();
   state.previewSource = "generated";
+  state.renderedContentRevision = null;
+  state.pendingPreviewContentRevision = null;
+  state.pendingPreviewVersion = null;
   elements.preview.removeAttribute("srcdoc");
   elements.preview.src = `${generatedPreviewUrl()}?ts=${Date.now()}`;
 }
@@ -444,7 +454,7 @@ function createLayoutMeasurementPage(documentInFrame) {
   return { host, page };
 }
 
-async function selectDraftLayout() {
+async function selectDraftLayout(version = draftPreviewVersion) {
   const documentInFrame = previewDocument();
   if (!documentInFrame?.querySelector("#resume-page")) {
     return null;
@@ -456,10 +466,14 @@ async function selectDraftLayout() {
   }
 
   let selected = null;
+  const candidates = [...state.layoutCandidates];
   try {
-    for (const candidate of state.layoutCandidates) {
+    for (const candidate of candidates) {
       applyLayoutCandidateVariables(measurement.host.style, candidate);
       await nextPreviewFrame(documentInFrame);
+      if (version !== draftPreviewVersion || previewDocument() !== documentInFrame) {
+        return null;
+      }
       const metrics = measurePreviewContent(measurement.page);
       const verticalOverflow = Math.max(0, metrics.height - metrics.pageHeight);
       const horizontalOverflow = Math.max(0, metrics.width - metrics.pageWidth);
@@ -477,10 +491,43 @@ async function selectDraftLayout() {
     measurement.host.remove();
   }
 
-  if (selected) {
+  if (selected && version === draftPreviewVersion && previewDocument() === documentInFrame) {
     applyLayoutCandidate(documentInFrame, selected.candidate);
   }
   return selected;
+}
+
+function finalizeDraftPreview(selected, version, contentRevision) {
+  if (!selected
+    || version !== draftPreviewVersion
+    || state.previewSource !== "draft"
+    || contentRevision !== state.contentRevision) {
+    return false;
+  }
+
+  state.pendingPreviewVersion = null;
+  state.pendingPreviewContentRevision = null;
+  state.renderedContentRevision = contentRevision;
+  const pendingMessage = state.pendingDraftPreviewMessage;
+  state.pendingDraftPreviewMessage = "";
+  state.effectiveLayout = selected.candidate;
+  state.layoutOverflow = selected.overflow;
+  state.density = "custom";
+  if (selected.overflow.total > fitTolerancePx) {
+    state.draftPreview = "overflow";
+    const overflowMessage = `草稿预览超出 ${selected.overflow.total}px，请缩短最长模块或调整排版设置。`;
+    setMessage(pendingMessage ? `${pendingMessage}；${overflowMessage}` : overflowMessage, "error");
+    return true;
+  }
+
+  state.draftPreview = "ready";
+  if (pendingMessage) {
+    setMessage(`${pendingMessage}；草稿预览已更新，PDF 待生成`, "ok");
+  } else {
+    setMessage(state.dirty ? "草稿预览已更新，内容尚未保存" : "草稿预览已更新，PDF 待生成", "warning");
+  }
+  markPreviewSelection();
+  return true;
 }
 
 function scheduleDraftPreview(delay = draftPreviewDelayMs) {
@@ -504,6 +551,7 @@ async function renderDraftPreview(version) {
 
   state.draftPreview = "rendering";
   renderStatus();
+  const contentRevision = state.contentRevision;
   try {
     const body = await requestJson("/api/preview", {
       method: "POST",
@@ -516,7 +564,17 @@ async function renderDraftPreview(version) {
 
     state.layoutCandidates = previewLayoutCandidates(body.layout);
     state.previewSource = "draft";
+    if (state.renderedContentRevision === contentRevision
+      && previewDocument()?.querySelector("#resume-page")) {
+      state.draftPreview = "measuring";
+      const selected = await selectDraftLayout(version);
+      finalizeDraftPreview(selected, version, contentRevision);
+      return;
+    }
+
     state.draftPreview = "loading";
+    state.pendingPreviewVersion = version;
+    state.pendingPreviewContentRevision = contentRevision;
     elements.preview.srcdoc = body.html;
   } catch (error) {
     if (version !== draftPreviewVersion) {
@@ -2019,7 +2077,7 @@ function focusLayoutControl(selector) {
 }
 
 function commitLayoutChange(focusSelector) {
-  markDirty();
+  markDirty("layout");
   renderForm();
   focusLayoutControl(focusSelector);
 }
@@ -2216,6 +2274,10 @@ function resetResumeEditorState() {
   state.selectedPreviewSection = "";
   state.selectedPreviewPath = "";
   state.previewSource = "generated";
+  state.contentRevision = 0;
+  state.renderedContentRevision = null;
+  state.pendingPreviewContentRevision = null;
+  state.pendingPreviewVersion = null;
   state.pendingDelete = null;
 }
 
@@ -2855,30 +2917,13 @@ elements.preview.addEventListener("load", async () => {
   fitPreviewFrame();
   markPreviewSelection();
   if (state.previewSource === "draft") {
-    const selected = await selectDraftLayout();
-    if (!selected || state.previewSource !== "draft") {
+    const version = state.pendingPreviewVersion;
+    const contentRevision = state.pendingPreviewContentRevision;
+    if (version === null || contentRevision === null) {
       return;
     }
-
-    const pendingMessage = state.pendingDraftPreviewMessage;
-    state.pendingDraftPreviewMessage = "";
-    state.effectiveLayout = selected.candidate;
-    state.layoutOverflow = selected.overflow;
-    state.density = "custom";
-    if (selected.overflow.total > fitTolerancePx) {
-      state.draftPreview = "overflow";
-      const overflowMessage = `草稿预览超出 ${selected.overflow.total}px，请缩短最长模块或调整排版设置。`;
-      setMessage(pendingMessage ? `${pendingMessage}；${overflowMessage}` : overflowMessage, "error");
-      return;
-    }
-
-    state.draftPreview = "ready";
-    if (pendingMessage) {
-      setMessage(`${pendingMessage}；草稿预览已更新，PDF 待生成`, "ok");
-    } else {
-      setMessage(state.dirty ? "草稿预览已更新，内容尚未保存" : "草稿预览已更新，PDF 待生成", "warning");
-    }
-    markPreviewSelection();
+    const selected = await selectDraftLayout(version);
+    finalizeDraftPreview(selected, version, contentRevision);
     return;
   }
 
@@ -2887,6 +2932,9 @@ elements.preview.addEventListener("load", async () => {
     scheduleDraftPreview(0);
     return;
   }
+  state.renderedContentRevision = !state.dirty && state.generation !== "needs generate"
+    ? state.contentRevision
+    : null;
   warnIfPreviewNeedsRegeneration();
 });
 new ResizeObserver(fitPreviewFrame).observe(elements.previewStage);
