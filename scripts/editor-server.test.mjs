@@ -1657,6 +1657,13 @@ test("POST /api/preview renders draft HTML without writing project files", async
   const previewBefore = readFileSync(previewPath, "utf8");
   const draft = structuredClone(validResume);
   draft.profile.name = "实时草稿姓名";
+  draft.layout = {
+    mode: "fixed",
+    fontSizePt: 10.5,
+    lineHeight: 1.3,
+    spacingLevel: 50,
+    marginPreset: "narrow"
+  };
   const app = await startEditorServer({
     preferredPort: 0,
     maxPort: 0,
@@ -1680,10 +1687,63 @@ test("POST /api/preview renders draft HTML without writing project files", async
   assert.match(body.html, /data-path="profile\.name"/);
   assert.match(body.html, /href="\/templates\/resume\.css"/);
   assert.match(body.html, /src="\/assets\/photo\.svg"/);
+  assert.match(body.html, /data-layout-mode="fixed"/);
+  assert.match(body.html, /--body-size:\s*10\.5pt/);
+  assert.equal(body.layout.mode, "fixed");
+  assert.equal(body.layout.candidates.length, 1);
+  assert.deepEqual(body.layout.candidates[0], {
+    mode: "fixed",
+    fontSizePt: 10.5,
+    lineHeight: 1.3,
+    spacingLevel: 50,
+    marginPreset: "narrow",
+    cssVariables: {
+      "--body-size": "10.5pt",
+      "--body-line-height": "1.3",
+      "--page-x": "6mm",
+      "--page-y": "4mm",
+      "--item-gap": "2px",
+      "--section-gap": "6px",
+      "--experience-gap": "4px",
+      "--bullet-indent": "15px",
+      "--profile-size": "11.96pt",
+      "--section-title-size": "13.61pt",
+      "--skill-title-size": "12.25pt",
+      "--experience-title-size": "12.64pt"
+    }
+  });
+  assert.equal(JSON.stringify(body).includes(rootDir), false);
   assert.equal(readFileSync(resumePath, "utf8"), resumeBefore);
   assert.equal(readFileSync(previewPath, "utf8"), previewBefore);
   assert.equal(existsSync(path.join(rootDir, "backups/cpp/resume.backup.yaml")), false);
   assert.equal(existsSync(path.join(rootDir, "backups")), false);
+});
+
+test("POST /api/preview rejects invalid layout settings", async (t) => {
+  const rootDir = makeApiFixture();
+  const draft = structuredClone(validResume);
+  draft.layout = { fontSizePt: 9.9 };
+  const app = await startEditorServer({
+    preferredPort: 0,
+    maxPort: 0,
+    rootDir,
+    log: false
+  });
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await fetch(`${app.url}/api/preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ resumeId: "cpp", resume: draft })
+  });
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(body.ok, false);
+  assert.match(body.error, /layout\.fontSizePt must be between 10\.2 and 11\.2/);
+  assert.equal(JSON.stringify(body).includes(rootDir), false);
 });
 
 test("PUT /api/resume validates and saves resume yaml", async (t) => {
@@ -1831,6 +1891,15 @@ test("POST /api/generate returns generation metadata and output URLs", async (t)
     generateResume: async () => ({
       density: "tight",
       metrics: { height: 1074 },
+      layout: {
+        mode: "auto",
+        fontSizePt: 10.2,
+        lineHeight: 1.25,
+        spacingLevel: 0,
+        marginPreset: "narrow",
+        cssVariables: { "--body-size": "10.2pt" }
+      },
+      overflow: { vertical: 0, horizontal: 0, total: 0 },
       outputPaths: {
         preview: previewHtmlPath(rootDir),
         pdf: path.join(rootDir, "output/resume.pdf"),
@@ -1854,6 +1923,15 @@ test("POST /api/generate returns generation metadata and output URLs", async (t)
   assert.equal(body.ok, true);
   assert.equal(body.density, "tight");
   assert.equal(body.contentHeight, 1074);
+  assert.deepEqual(body.layout, {
+    mode: "auto",
+    fontSizePt: 10.2,
+    lineHeight: 1.25,
+    spacingLevel: 0,
+    marginPreset: "narrow",
+    cssVariables: { "--body-size": "10.2pt" }
+  });
+  assert.deepEqual(body.overflow, { vertical: 0, horizontal: 0, total: 0 });
   assert.equal(body.outputs.pdf, "/output/cpp/resume.pdf");
   assert.equal(body.outputs.png, "/output/cpp/resume.png");
   assert.equal(body.outputs.html, "/output/cpp/preview.html");

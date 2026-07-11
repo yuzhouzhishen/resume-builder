@@ -9,9 +9,11 @@ import { resolveAppPaths } from "./app-paths.mjs";
 import { createDataImportManager, createDataPackage } from "./data-package.mjs";
 import { createDataRecoveryManager } from "./data-recovery.mjs";
 import { ensureDataRoot } from "./data-root.mjs";
+import { buildLayoutCandidates, publicLayoutCandidate } from "./layout-settings.mjs";
 import { resolvePathInside } from "./path-safety.mjs";
 import {
   loadResumeYaml,
+  resolveResumeLayout,
   resolveResumeAssetPath,
   saveResumeYaml,
   validateResume
@@ -643,6 +645,8 @@ async function handleGenerateApi(request, response, projectRoot, dataRoot, gener
       resumeId: context.entry.id,
       density: result.density,
       contentHeight: result.metrics?.height,
+      layout: result.layout,
+      overflow: result.overflow,
       outputs: {
         pdf: `/output/${context.entry.id}/resume.pdf`,
         png: `/output/${context.entry.id}/resume.png`,
@@ -667,13 +671,22 @@ async function handlePreviewApi(request, response, projectRoot, dataRoot, bodyLi
     const body = await readJsonBody(request, bodyLimitBytes);
     const context = loadResumeContext(dataRoot, body.resumeId);
     const resume = validateResume(body.resume, dataRoot);
+    const candidates = buildLayoutCandidates(resolveResumeLayout(resume));
     const html = renderResumeHtml(resume, {
-      density: "normal",
+      layoutCandidate: candidates[0],
       cssPath: "/templates/resume.css",
       templateFile: path.join(projectRoot, "templates", "resume.html"),
       assetPrefix: "/"
     });
-    sendJson(response, 200, { ok: true, resumeId: context.entry.id, html });
+    sendJson(response, 200, {
+      ok: true,
+      resumeId: context.entry.id,
+      html,
+      layout: {
+        mode: candidates[0].settings.mode,
+        candidates: candidates.map(publicLayoutCandidate)
+      }
+    });
   } catch (error) {
     sendJson(response, error.statusCode || 400, {
       ok: false,
