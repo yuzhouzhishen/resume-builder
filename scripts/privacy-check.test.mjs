@@ -251,6 +251,31 @@ test("GitHub generated noreply commit metadata is allowed", () => {
   assert.equal(result.violations.some(({ rule }) => rule === "commit-email"), false);
 });
 
+test("GitHub synthetic pull request merge refs are excluded from repository history", () => {
+  const root = makeRepository();
+  writeFileSync(path.join(root, "README.md"), "base fixture\n");
+  commitAll(root, "Base fixture");
+
+  git(root, "checkout", "-b", "feature");
+  writeFileSync(path.join(root, "feature.txt"), "feature fixture\n");
+  commitAll(root, "Feature fixture");
+
+  git(root, "checkout", "main");
+  writeFileSync(path.join(root, "main.txt"), "main fixture\n");
+  commitAll(root, "Main fixture");
+  git(root, "config", "user.email", ["person", "mail.example"].join("@"));
+  git(root, "merge", "--no-ff", "feature", "-m", "Synthetic pull request merge");
+  const syntheticMerge = git(root, "rev-parse", "HEAD");
+  git(root, "update-ref", "refs/pull/1/merge", syntheticMerge);
+  git(root, "update-ref", "refs/remotes/origin/pr/1/merge", syntheticMerge);
+  git(root, "reset", "--hard", "HEAD^1");
+
+  const result = scanRepository(root);
+
+  assert.equal(result.violations.some(({ rule }) => rule === "commit-email"), false);
+  assert.equal(result.stats.commitCount, 3);
+});
+
 test("extensionless binary and oversized text blobs are rejected", () => {
   const root = makeRepository();
   const binary = Buffer.from([1, 2, 3, 4]);

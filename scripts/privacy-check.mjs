@@ -22,6 +22,14 @@ const ALLOWED_EMAILS = new Set(["noreply@github.com"]);
 const MAX_TEXT_BLOB_BYTES = 2 * 1024 * 1024;
 const BLOB_BATCH_SIZE = 32;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const HISTORY_REVISION_ARGS = [
+  "--exclude=refs/pull/*/merge",
+  "--exclude=refs/remotes/pr/*/merge",
+  "--exclude=refs/remotes/pull/*/merge",
+  "--exclude=refs/remotes/*/pr/*/merge",
+  "--exclude=refs/remotes/*/pull/*/merge",
+  "--all"
+];
 
 function isAllowedEmail(email) {
   if (ALLOWED_EMAILS.has(email.toLowerCase())) return true;
@@ -176,7 +184,7 @@ function readTrackedEntries(root) {
 }
 
 function readHistoryObjects(root) {
-  const output = git(root, ["rev-list", "--objects", "--all"]).trim();
+  const output = git(root, ["rev-list", "--objects", ...HISTORY_REVISION_ARGS]).trim();
   if (!output) return [];
 
   return output.split("\n").flatMap((line) => {
@@ -194,13 +202,18 @@ function readHistoryPaths(root) {
     "--name-only",
     "--format=",
     "--no-renames",
-    "-z"
+    "-z",
+    ...HISTORY_REVISION_ARGS
   ]);
   return output.split("\0").filter(Boolean);
 }
 
 function readCommitViolations(root) {
-  const output = git(root, ["log", "--all", "--format=%H%x00%ae%x00%ce"]);
+  const output = git(root, [
+    "log",
+    "--format=%H%x00%ae%x00%ce",
+    ...HISTORY_REVISION_ARGS
+  ]);
   const violations = [];
 
   for (const line of output.split("\n").filter(Boolean)) {
@@ -364,7 +377,11 @@ export function scanRepository(root = process.cwd()) {
     stats: {
       trackedPathCount: trackedPaths.length,
       historyBlobCount,
-      commitCount: Number(git(repositoryRoot, ["rev-list", "--count", "--all"]).trim())
+      commitCount: Number(git(repositoryRoot, [
+        "rev-list",
+        "--count",
+        ...HISTORY_REVISION_ARGS
+      ]).trim())
     }
   };
 }
