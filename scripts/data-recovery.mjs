@@ -224,6 +224,24 @@ export function createDataRecoveryManager(options) {
         );
       }
 
+      let stagingBeforePublication;
+      try {
+        stagingBeforePublication = fingerprintRegularTree(stagingRoot);
+      } catch {
+        throw createStatusError(
+          "The staged snapshot is not a safe regular-tree copy.",
+          409,
+          "restore-staging-copy-mismatch"
+        );
+      }
+      if (stagingBeforePublication !== sourceFingerprint) {
+        throw createStatusError(
+          "The staged snapshot does not exactly match the selected snapshot.",
+          409,
+          "restore-staging-copy-mismatch"
+        );
+      }
+
       try {
         rename(dataRoot, backupRoot);
       } catch {
