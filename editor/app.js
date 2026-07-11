@@ -2076,18 +2076,20 @@ function focusLayoutControl(selector) {
   elements.form.querySelector(selector)?.focus();
 }
 
-function commitLayoutChange(focusSelector) {
+function commitLayoutChange(focusSelector, { rerender = true } = {}) {
   markDirty("layout");
-  renderForm();
-  focusLayoutControl(focusSelector);
+  if (rerender) {
+    renderForm();
+    focusLayoutControl(focusSelector);
+  }
 }
 
-function setLayoutSetting(field, value, focusSelector) {
+function setLayoutSetting(field, value, focusSelector, options) {
   if (state.resume.layout[field] === value) {
     return false;
   }
   state.resume.layout[field] = value;
-  commitLayoutChange(focusSelector);
+  commitLayoutChange(focusSelector, options);
   return true;
 }
 
@@ -2098,11 +2100,38 @@ function normalizedLayoutNumber(field, rawValue) {
   return Number(clamped.toFixed(config.precision));
 }
 
-function setLayoutNumber(field, rawValue, focusSelector) {
+function setLayoutNumber(field, rawValue, focusSelector, options) {
   if (!layoutNumberFields[field]) {
     return false;
   }
-  return setLayoutSetting(field, normalizedLayoutNumber(field, rawValue), focusSelector);
+  return setLayoutSetting(field, normalizedLayoutNumber(field, rawValue), focusSelector, options);
+}
+
+function syncLayoutNumberControl(field, input) {
+  const config = layoutNumberFields[field];
+  const control = input.closest("[data-layout-control]");
+  if (!config || !control) {
+    return;
+  }
+
+  const value = Number(state.resume.layout[field]);
+  const normalizedValue = layoutNumberValue(field, value);
+  const displayValue = `${normalizedValue}${config.unit}`;
+  input.value = normalizedValue;
+  input.setAttribute("aria-valuetext", displayValue);
+  const output = control.querySelector(`[data-layout-output="${field}"]`);
+  if (output) {
+    output.value = displayValue;
+    output.textContent = displayValue;
+  }
+  const decrease = control.querySelector(`[data-action="step-layout"][data-direction="-1"]`);
+  const increase = control.querySelector(`[data-action="step-layout"][data-direction="1"]`);
+  if (decrease) {
+    decrease.disabled = value <= config.min;
+  }
+  if (increase) {
+    increase.disabled = value >= config.max;
+  }
 }
 
 function resetLayoutSettings() {
@@ -2860,7 +2889,13 @@ elements.form.addEventListener("input", (event) => {
   const layoutControl = event.target.closest("input[data-layout-field]");
   if (layoutControl) {
     const field = layoutControl.dataset.layoutField;
-    setLayoutNumber(field, layoutControl.value, `input[data-layout-field="${field}"]`);
+    setLayoutNumber(
+      field,
+      layoutControl.value,
+      `input[data-layout-field="${field}"]`,
+      { rerender: false }
+    );
+    syncLayoutNumberControl(field, layoutControl);
     return;
   }
 
