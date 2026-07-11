@@ -10,6 +10,10 @@
   --page-y: 6mm;
   --body-size: 10.8pt;
   --body-line-height: 1.38;
+  --profile-size: 12.3pt;
+  --section-title-size: 14pt;
+  --skill-title-size: 12.6pt;
+  --experience-title-size: 13pt;
   --item-gap: 3px;
   --section-gap: 8px;
   --experience-gap: 5px;
@@ -19,33 +23,6 @@
   --bar: #eeeeef;
   --rule: #272633;
   --link: #0659d9;
-}
-
-body[data-density="normal"] {
-  --body-size: 10.8pt;
-  --body-line-height: 1.38;
-  --item-gap: 3px;
-  --section-gap: 8px;
-  --experience-gap: 5px;
-  --bullet-indent: 16px;
-}
-
-body[data-density="compact"] {
-  --body-size: 10.5pt;
-  --body-line-height: 1.32;
-  --item-gap: 2px;
-  --section-gap: 6px;
-  --experience-gap: 4px;
-  --bullet-indent: 15px;
-}
-
-body[data-density="tight"] {
-  --body-size: 10.2pt;
-  --body-line-height: 1.25;
-  --item-gap: 1px;
-  --section-gap: 4px;
-  --experience-gap: 3px;
-  --bullet-indent: 14px;
 }
 
 * {
@@ -88,7 +65,7 @@ body {
   column-gap: 10mm;
   row-gap: 2.2mm;
   max-width: 155mm;
-  font-size: 12.3pt;
+  font-size: var(--profile-size);
   line-height: 1.22;
   font-weight: 700;
 }
@@ -120,7 +97,7 @@ body {
   padding-left: 5.2mm;
   background: var(--bar);
   color: #262832;
-  font-size: 14pt;
+  font-size: var(--section-title-size);
   line-height: 1;
   font-weight: 500;
 }
@@ -141,7 +118,7 @@ body {
 
 .skill-group h3 {
   margin: 0 0 1.8mm;
-  font-size: 12.6pt;
+  font-size: var(--skill-title-size);
   line-height: 1.15;
   font-weight: 800;
 }
@@ -182,7 +159,7 @@ body {
   gap: 2mm;
   align-items: baseline;
   margin: 0 0 2.1mm;
-  font-size: 13pt;
+  font-size: var(--experience-title-size);
   line-height: 1.15;
   font-weight: 800;
   color: #111217;

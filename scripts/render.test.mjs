@@ -14,6 +14,7 @@ import {
   saveResumeYaml,
   validateResume
 } from "./generate.mjs";
+import { buildLayoutCandidates } from "./layout-settings.mjs";
 import { resolveResumeLayout } from "./resume-data.mjs";
 
 const validResume = {
@@ -303,6 +304,37 @@ test("renderResumeHtml includes core resume sections and links", () => {
   assert.match(html, /项目经历/);
   assert.match(html, /https:\/\/example\.com\/resume-project/);
   assert.match(html, /data-density="normal"/);
+});
+
+test("renderResumeHtml embeds selected layout variables", () => {
+  const candidate = buildLayoutCandidates({
+    mode: "fixed",
+    fontSizePt: 10.5,
+    lineHeight: 1.3,
+    spacingLevel: 50,
+    marginPreset: "narrow"
+  })[0];
+  const html = renderResumeHtml(validResume, {
+    layoutCandidate: candidate,
+    cssPath: "templates/resume.css"
+  });
+
+  assert.match(html, /data-layout-mode="fixed"/);
+  assert.match(html, /data-density="custom"/);
+  assert.match(html, /--body-size:\s*10\.5pt/);
+  assert.match(html, /--body-line-height:\s*1\.3/);
+  assert.match(html, /--page-x:\s*6mm/);
+  assert.match(html, /--page-y:\s*4mm/);
+});
+
+test("resume template typography uses explicit layout variables", () => {
+  const css = readFileSync(path.resolve("templates/resume.css"), "utf8");
+
+  assert.match(css, /font-size:\s*var\(--profile-size\)/);
+  assert.match(css, /font-size:\s*var\(--section-title-size\)/);
+  assert.match(css, /font-size:\s*var\(--skill-title-size\)/);
+  assert.match(css, /font-size:\s*var\(--experience-title-size\)/);
+  assert.doesNotMatch(css, /body\[data-density="(?:normal|compact|tight)"\]/);
 });
 
 test("renderResumeHtml marks preview-clickable sections with stable ids", () => {

@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { chromium } from "playwright";
 
+import { compatibilityDensity } from "./layout-settings.mjs";
 import {
   DEFAULT_SECTION_ORDER,
   SECTION_TITLES,
@@ -215,23 +216,33 @@ function renderContent(data, options) {
 }
 
 export function renderResumeHtml(data, options = {}) {
-  const density = options.density || "normal";
+  const density = options.density || (options.layoutCandidate
+    ? compatibilityDensity(options.layoutCandidate)
+    : "normal");
+  const layoutMode = options.layoutCandidate?.settings?.mode || data.layout?.mode || "auto";
   const cssPath = options.cssPath || "../templates/resume.css";
   const templateFile = options.templateFile || DEFAULT_TEMPLATE_FILE;
   const template = existsSync(templateFile)
     ? readFileSync(templateFile, "utf8")
-    : "<!doctype html><html><head><title>{{title}}</title></head><body data-density=\"{{density}}\">{{content}}</body></html>";
+    : "<!doctype html><html><head><title>{{title}}</title></head><body data-density=\"{{density}}\" data-layout-mode=\"{{layoutMode}}\">{{content}}</body></html>";
 
-  const html = template
+  let html = template
     .replaceAll("{{title}}", escapeHtml(`${data.profile.name} - Resume`))
     .replaceAll("{{density}}", escapeAttribute(density))
+    .replaceAll("{{layoutMode}}", escapeAttribute(layoutMode))
     .replace("../templates/resume.css", escapeAttribute(cssPath))
     .replace("{{content}}", renderContent(data, options));
 
   if (typeof options.cssText === "string") {
-    return html.replace(
+    html = html.replace(
       /<link\s+rel="stylesheet"\s+href="[^"]+">/,
       `<style>\n${options.cssText}\n</style>`
+    );
+  }
+  if (options.layoutCandidate) {
+    html = html.replace(
+      "</head>",
+      `<style data-layout-variables>\n:root { ${densityStyle(options.layoutCandidate)} }\n</style>\n</head>`
     );
   }
   return html;
@@ -246,7 +257,8 @@ function resolveAssetSrc(assetPath, assetPrefix) {
 }
 
 function densityStyle(profile) {
-  return Object.entries(profile.vars)
+  const variables = profile.cssVariables || profile.vars;
+  return Object.entries(variables)
     .map(([name, value]) => `${name}: ${value};`)
     .join(" ");
 }

@@ -200,3 +200,21 @@ export function publicLayoutCandidate(candidate) {
     cssVariables: { ...candidate.cssVariables }
   };
 }
+
+export function compatibilityDensity(candidate) {
+  const settings = candidate?.settings || candidate;
+  if (!settings || settings.marginPreset !== "normal") {
+    return "custom";
+  }
+  const signatures = [
+    ["normal", 10.8, 1.38, 67],
+    ["compact", 10.5, 1.32, 50],
+    ["tight", 10.2, 1.25, 0]
+  ];
+  const match = signatures.find(([, fontSizePt, lineHeight, spacingLevel]) => (
+    settings.fontSizePt === fontSizePt
+    && settings.lineHeight === lineHeight
+    && settings.spacingLevel === spacingLevel
+  ));
+  return match?.[0] || "custom";
+}
