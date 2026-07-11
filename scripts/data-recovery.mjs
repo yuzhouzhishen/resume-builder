@@ -328,9 +328,44 @@ export function createDataRecoveryManager(options) {
 
       ownedStaging = null;
       let registry;
+      let finalFailure;
       try {
         registry = validate(dataRoot);
       } catch {
+        finalFailure = {
+          statusCode: 500,
+          code: "restore-final-validation-failed",
+          quarantineMessage:
+            "Restored data failed final validation and could not be quarantined. Manual recovery is required.",
+          rollbackMessage:
+            "Restored data failed final validation and the previous data could not be restored. Manual recovery is required.",
+          message:
+            "Restored data failed final validation. The previous data was restored and the failed publication was quarantined."
+        };
+      }
+
+      if (!finalFailure) {
+        let publishedFingerprint;
+        try {
+          publishedFingerprint = fingerprintRegularTree(dataRoot);
+        } catch {
+          publishedFingerprint = null;
+        }
+        if (publishedFingerprint !== sourceFingerprint) {
+          finalFailure = {
+            statusCode: 409,
+            code: "restore-staging-copy-mismatch",
+            quarantineMessage:
+              "Published restore did not match the selected snapshot and could not be quarantined. Manual recovery is required.",
+            rollbackMessage:
+              "Published restore did not match the selected snapshot and the previous data could not be restored. Manual recovery is required.",
+            message:
+              "Published restore did not match the selected snapshot. The previous data was restored and the failed publication was quarantined."
+          };
+        }
+      }
+
+      if (finalFailure) {
         try {
           const quarantineRoot = findAvailablePath(
             `${dataRoot}.failed-restore-${token}`,
@@ -339,7 +374,7 @@ export function createDataRecoveryManager(options) {
           rename(dataRoot, quarantineRoot);
         } catch {
           throw createStatusError(
-            "Restored data failed final validation and could not be quarantined. Manual recovery is required.",
+            finalFailure.quarantineMessage,
             500,
             "restore-quarantine-failed"
           );
@@ -348,15 +383,15 @@ export function createDataRecoveryManager(options) {
           rename(backupRoot, dataRoot);
         } catch {
           throw createStatusError(
-            "Restored data failed final validation and the previous data could not be restored. Manual recovery is required.",
+            finalFailure.rollbackMessage,
             500,
             "restore-rollback-failed"
           );
         }
         throw createStatusError(
-          "Restored data failed final validation. The previous data was restored and the failed publication was quarantined.",
-          500,
-          "restore-final-validation-failed"
+          finalFailure.message,
+          finalFailure.statusCode,
+          finalFailure.code
         );
       }
 

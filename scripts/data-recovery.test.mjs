@@ -1094,6 +1094,72 @@ test("restore rejects regular staging-file mutation after validation before publ
   assert.equal(manager.isRestoring(), false);
 });
 
+test("restore quarantines regular staging-file mutation after the pre-publication fingerprint", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  writeFileSync(path.join(source.rootDir, "assets/photo.svg"), "<svg>selected-source</svg>");
+  const stagingRoot = path.join(
+    parent,
+    `.${path.basename(dataRoot)}.restore-publication-mutation-token`
+  );
+  const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
+  const quarantineRoot = `${dataRoot}.failed-restore-publication-mutation-token`;
+  let renameCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    now: () => new Date("2026-07-11T08:09:10.000Z"),
+    tokenFactory: () => "publication-mutation-token",
+    rename(sourceRoot, targetRoot) {
+      renameCalls += 1;
+      if (renameCalls === 1) {
+        writeFileSync(
+          path.join(stagingRoot, "assets/photo.svg"),
+          "<svg>mutated-during-first-rename</svg>"
+        );
+      }
+      renameSync(sourceRoot, targetRoot);
+    },
+    validate(rootDir) {
+      const registry = validateDataRoot(rootDir);
+      if (rootDir === dataRoot) {
+        assert.equal(
+          readFileSync(path.join(rootDir, "assets/photo.svg"), "utf8"),
+          "<svg>mutated-during-first-rename</svg>"
+        );
+        writeFileSync(
+          path.join(rootDir, "assets/photo.svg"),
+          "<svg>mutated-during-final-validation</svg>"
+        );
+      }
+      return registry;
+    }
+  });
+
+  const error = captureError(() => manager.restore(snapshotId(source.basename)));
+
+  assert.equal(error.statusCode, 409);
+  assert.equal(error.code, "restore-staging-copy-mismatch");
+  assert.match(error.message, /previous data was restored.*quarantined/i);
+  assert.equal(error.message.includes(parent), false);
+  assert.equal(renameCalls, 4);
+  assert.equal(
+    readFileSync(path.join(dataRoot, "assets/photo.svg"), "utf8"),
+    "<svg>official-before</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(source.rootDir, "assets/photo.svg"), "utf8"),
+    "<svg>selected-source</svg>"
+  );
+  assert.equal(
+    readFileSync(path.join(quarantineRoot, "assets/photo.svg"), "utf8"),
+    "<svg>mutated-during-final-validation</svg>"
+  );
+  assert.equal(existsSync(backupRoot), false);
+  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(manager.isRestoring(), false);
+});
+
 test("restore rejects a replaced staging inode before publication and restores current data", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   writeFileSync(path.join(dataRoot, "assets/photo.svg"), "<svg>official-before</svg>");
