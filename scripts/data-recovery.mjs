@@ -12,7 +12,6 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
-  rmSync,
   unlinkSync,
   writeFileSync
 } from "node:fs";
@@ -24,7 +23,10 @@ const INVALID_DATA_REASON = "Snapshot data is invalid.";
 const UNSAFE_TREE_REASON = "Snapshot contains an unsafe filesystem entry.";
 const SNAPSHOT_ID_PATTERN = /^[a-f0-9]{64}$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/;
-const DEFAULT_INVALID_LOCK_STALE_MS = 5 * 60 * 1000;
+const LOCK_RELEASE_WARNING = {
+  code: "restore-lock-release-pending",
+  message: "Recovery completed, but its lock still needs cleanup."
+};
 
 export function listDataSnapshots(options) {
   return discoverDataSnapshots(options.dataRoot).map(({ summary }) => summary);
@@ -45,10 +47,7 @@ export function createDataRecoveryManager(options) {
   const unlink = options.unlink || unlinkSync;
   const verifyClaimedLock = options.verifyClaimedLock || readLockOwner;
   const validate = options.validate || validateDataRoot;
-  const remove = options.remove || rmSync;
   const isProcessAlive = options.isProcessAlive || processIsAlive;
-  const lockNow = options.lockNow || Date.now;
-  const invalidLockStaleMs = options.invalidLockStaleMs ?? DEFAULT_INVALID_LOCK_STALE_MS;
   let restoring = false;
   let ownedStaging = null;
   let ownedLock = null;
@@ -61,12 +60,16 @@ export function createDataRecoveryManager(options) {
     if (restoring) {
       throw createStatusError("A data restore is already in progress.", 423, "restore-locked");
     }
-    if (ownedStaging) {
-      throw createStatusError(
-        "A previous restore staging cleanup is still pending.",
-        423,
-        "restore-cleanup-pending"
-      );
+    if (ownedLock) {
+      try {
+        releaseOwnedLock();
+      } catch {
+        throw createStatusError(
+          "A previous recovery transaction lock still needs cleanup.",
+          423,
+          "restore-lock-release-pending"
+        );
+      }
     }
     if (typeof snapshotId !== "string" || !SNAPSHOT_ID_PATTERN.test(snapshotId)) {
       throw createStatusError("Snapshot ID is invalid.", 400, "invalid-snapshot-id");
@@ -95,6 +98,7 @@ export function createDataRecoveryManager(options) {
     let token;
     let stagingRoot;
     let backupRoot;
+    let committedResult = null;
     try {
       acquireRecoveryLock();
       try {
@@ -109,7 +113,9 @@ export function createDataRecoveryManager(options) {
           "restore-token-failed"
         );
       }
-      stagingRoot = path.join(parentDir, `.${dataBasename}.restore-${token}`);
+      stagingRoot = findAvailablePath(
+        path.join(parentDir, `.${dataBasename}.restore-${token}`)
+      );
 
       try {
         mkdir(stagingRoot, { recursive: false, mode: 0o700 });
@@ -348,47 +354,30 @@ export function createDataRecoveryManager(options) {
         );
       }
 
-      return {
+      committedResult = {
         registry,
         preRestoreBackup: path.basename(backupRoot)
       };
+      return committedResult;
     } catch (error) {
       primaryError = error;
       throw error;
     } finally {
-      let finalizationError = null;
       try {
         if (ownedStaging) {
-          try {
-            removeOwnedStaging();
-          } catch {
-            if (!primaryError) {
-              finalizationError = createStatusError(
-                "Temporary restore staging could not be cleaned up.",
-                500,
-                "restore-cleanup-failed"
-              );
-            }
-          }
+          ownedStaging = null;
         }
         if (ownedLock) {
           try {
             releaseOwnedLock();
           } catch {
-            if (!primaryError && !finalizationError) {
-              finalizationError = createStatusError(
-                "The recovery transaction lock could not be released.",
-                500,
-                "restore-lock-release-failed"
-              );
+            if (!primaryError && committedResult) {
+              committedResult.warnings = [{ ...LOCK_RELEASE_WARNING }];
             }
           }
         }
       } finally {
         restoring = false;
-      }
-      if (finalizationError) {
-        throw finalizationError;
       }
     }
   }
@@ -397,33 +386,19 @@ export function createDataRecoveryManager(options) {
     if (restoring) {
       return;
     }
-    let disposalError = null;
     if (ownedStaging) {
-      try {
-        removeOwnedStaging();
-      } catch {
-        disposalError = createStatusError(
-          "Temporary restore staging could not be cleaned up.",
-          500,
-          "restore-cleanup-failed"
-        );
-      }
+      ownedStaging = null;
     }
     if (ownedLock) {
       try {
         releaseOwnedLock();
       } catch {
-        if (!disposalError) {
-          disposalError = createStatusError(
-            "The recovery transaction lock could not be released.",
-            500,
-            "restore-lock-release-failed"
-          );
-        }
+        throw createStatusError(
+          "The recovery transaction lock could not be released.",
+          500,
+          "restore-lock-release-failed"
+        );
       }
-    }
-    if (disposalError) {
-      throw disposalError;
     }
   }
 
@@ -439,109 +414,95 @@ export function createDataRecoveryManager(options) {
       );
     }
 
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const temporaryLockPath = path.join(
-        parentDir,
-        `.${dataBasename}.recovery-lock-${lockToken}-${process.pid}-${attempt + 1}.tmp`
+    const temporaryLockPath = path.join(
+      parentDir,
+      `.${dataBasename}.recovery-lock-${lockToken}-${process.pid}-1.tmp`
+    );
+    let temporaryOwner = null;
+    try {
+      writeFileSync(
+        temporaryLockPath,
+        `${JSON.stringify({ pid: process.pid, token: lockToken })}\n`,
+        { encoding: "utf8", flag: "wx", mode: 0o600 }
       );
-      let temporaryOwner = null;
+      temporaryOwner = readLockOwner(temporaryLockPath);
+      if (temporaryOwner.pid !== process.pid || temporaryOwner.token !== lockToken) {
+        throw new Error("Temporary recovery lock metadata changed");
+      }
+
       try {
-        writeFileSync(
-          temporaryLockPath,
-          `${JSON.stringify({ pid: process.pid, token: lockToken })}\n`,
-          { encoding: "utf8", flag: "wx", mode: 0o600 }
-        );
-        temporaryOwner = readLockOwner(temporaryLockPath);
-        if (temporaryOwner.pid !== process.pid || temporaryOwner.token !== lockToken) {
-          throw new Error("Temporary recovery lock metadata changed");
-        }
-
-        try {
-          link(temporaryLockPath, lockPath);
-        } catch (error) {
-          if (
-            error.code === "EEXIST"
-            && attempt === 0
-            && reclaimStaleRecoveryLock()
-          ) {
-            continue;
-          }
-          if (error.code === "EEXIST") {
-            throw createStatusError(
-              "Another recovery transaction is in progress.",
-              423,
-              "restore-locked"
-            );
-          }
-          throw createStatusError(
-            "The recovery transaction lock could not be acquired.",
-            500,
-            "restore-lock-acquire-failed"
-          );
-        }
-
-        ownedLock = {
-          path: lockPath,
-          identity: temporaryOwner.identity,
-          pid: process.pid,
-          token: lockToken
-        };
-        const claimedOwner = verifyClaimedLock(lockPath);
-        assertSameLockOwner(temporaryOwner, claimedOwner);
-        return;
+        link(temporaryLockPath, lockPath);
       } catch (error) {
-        if (error.statusCode) {
-          throw error;
+        if (error.code === "EEXIST") {
+          throw classifyExistingRecoveryLock();
         }
         throw createStatusError(
-          "The recovery transaction lock could not be initialized.",
+          "The recovery transaction lock could not be acquired.",
           500,
           "restore-lock-acquire-failed"
         );
-      } finally {
-        if (temporaryOwner) {
-          try {
-            const currentOwner = readLockOwner(temporaryLockPath);
-            assertSameLockOwner(temporaryOwner, currentOwner);
-            unlink(temporaryLockPath);
-          } catch {
-            // Never unlink a temporary path after its identity is lost.
-          }
+      }
+
+      ownedLock = {
+        path: lockPath,
+        identity: temporaryOwner.identity,
+        pid: process.pid,
+        token: lockToken
+      };
+      const claimedOwner = verifyClaimedLock(lockPath);
+      assertSameLockOwner(temporaryOwner, claimedOwner);
+    } catch (error) {
+      if (error.statusCode) {
+        throw error;
+      }
+      throw createStatusError(
+        "The recovery transaction lock could not be initialized.",
+        500,
+        "restore-lock-acquire-failed"
+      );
+    } finally {
+      if (temporaryOwner) {
+        try {
+          const currentOwner = readLockOwner(temporaryLockPath);
+          assertSameLockOwner(temporaryOwner, currentOwner);
+          unlink(temporaryLockPath);
+        } catch {
+          // Never unlink a temporary path after its identity is lost.
         }
       }
     }
   }
 
-  function reclaimStaleRecoveryLock() {
-    let lockStats;
+  function classifyExistingRecoveryLock() {
+    let owner;
     try {
-      lockStats = lstatSync(lockPath);
-      if (!lockStats.isFile()) {
-        return false;
-      }
-      let owner;
-      try {
-        owner = readLockOwner(lockPath);
-      } catch {
-        if (lockNow() - lockStats.mtimeMs < invalidLockStaleMs) {
-          return false;
-        }
-        if (!matchesFileIdentity(lockPath, lockStats)) {
-          return false;
-        }
-        unlink(lockPath);
-        return true;
-      }
-      if (isProcessAlive(owner.pid)) {
-        return false;
-      }
-      const currentOwner = readLockOwner(lockPath);
-      assertSameLockOwner(owner, currentOwner);
-      unlink(lockPath);
-      return true;
+      owner = readLockOwner(lockPath);
     } catch {
-      return false;
+      return createStatusError(
+        "The recovery transaction lock is invalid and requires manual cleanup.",
+        423,
+        "restore-lock-invalid"
+      );
     }
+
+    let alive = true;
+    try {
+      alive = isProcessAlive(owner.pid);
+    } catch {
+      // An uncertain owner must remain locked.
+    }
+    if (!alive) {
+      return createStatusError(
+        "A stale recovery transaction lock requires manual cleanup.",
+        423,
+        "restore-lock-stale"
+      );
+    }
+    return createStatusError(
+      "Another recovery transaction is in progress.",
+      423,
+      "restore-locked"
+    );
   }
 
   function releaseOwnedLock() {
@@ -559,14 +520,6 @@ export function createDataRecoveryManager(options) {
     assertSameLockOwner(owner, currentOwner);
     unlink(ownedLock.path);
     ownedLock = null;
-  }
-
-  function removeOwnedStaging() {
-    if (!verifyOwnedStaging()) {
-      return;
-    }
-    remove(ownedStaging.root, { force: true, recursive: true });
-    ownedStaging = null;
   }
 
   function verifyOwnedStaging(rootDir = ownedStaging.root) {
@@ -800,20 +753,6 @@ function matchesOwnedDirectory(ownedDirectory, rootDir = ownedDirectory.root) {
     stats.isDirectory()
     && stats.dev === ownedDirectory.identity.dev
     && stats.ino === ownedDirectory.identity.ino
-  );
-}
-
-function matchesFileIdentity(filePath, expectedStats) {
-  let stats;
-  try {
-    stats = lstatSync(filePath);
-  } catch {
-    return false;
-  }
-  return (
-    stats.isFile()
-    && stats.dev === expectedStats.dev
-    && stats.ino === expectedStats.ino
   );
 }
 

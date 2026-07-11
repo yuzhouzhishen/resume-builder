@@ -244,7 +244,7 @@ test("recovery lock blocks another manager before restore path selection", (t) =
   assert.equal(secondManager.isRestoring(), false);
 });
 
-test("recovery lock reclaims only a demonstrably stale owner", (t) => {
+test("recovery lock leaves a demonstrably stale owner unchanged for every manager", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
   const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
@@ -253,69 +253,87 @@ test("recovery lock reclaims only a demonstrably stale owner", (t) => {
     `${JSON.stringify({ pid: 999999, token: "dead-lock-token" })}\n`,
     { flag: "wx", mode: 0o600 }
   );
+  const lockBytes = readFileSync(lockRoot);
+  const lockIdentity = lstatSync(lockRoot);
   let livenessChecks = 0;
-  const manager = createDataRecoveryManager({
+  const managers = ["first", "second"].map((name) => createDataRecoveryManager({
     dataRoot,
-    lockTokenFactory: () => "replacement-lock-token",
-    tokenFactory: () => "stale-lock-restore-token",
+    lockTokenFactory: () => `${name}-replacement-lock-token`,
+    tokenFactory: () => `${name}-stale-lock-restore-token`,
     isProcessAlive(pid) {
       livenessChecks += 1;
       assert.equal(pid, 999999);
       return false;
     }
-  });
+  }));
 
-  const result = manager.restore(snapshotId(source.basename));
+  for (const manager of managers) {
+    const error = captureError(() => manager.restore(snapshotId(source.basename)));
+    assert.equal(error.statusCode, 423);
+    assert.equal(error.code, "restore-lock-stale");
+    assert.equal(error.message.includes(parent), false);
+    assert.deepEqual(readFileSync(lockRoot), lockBytes);
+    assert.equal(lstatSync(lockRoot).dev, lockIdentity.dev);
+    assert.equal(lstatSync(lockRoot).ino, lockIdentity.ino);
+  }
 
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.equal(livenessChecks, 1);
-  assert.equal(existsSync(lockRoot), false);
+  assert.equal(livenessChecks, 2);
+  assert.equal(existsSync(lockRoot), true);
   assert.equal(existsSync(source.rootDir), true);
-  assert.equal(manager.isRestoring(), false);
+  assert.equal(
+    readdirSync(parent).some((entry) => entry.endsWith(".tmp")),
+    false
+  );
 });
 
-test("recovery lock blocks a fresh invalid file and reclaims it only after stale age", (t) => {
+test("recovery lock leaves invalid files unchanged regardless of age", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
   const selectedId = snapshotId(source.basename);
   const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
   writeFileSync(lockRoot, "", { flag: "wx", mode: 0o600 });
-  const manager = createDataRecoveryManager({
-    dataRoot,
-    lockTokenFactory: () => "invalid-lock-replacement",
-    tokenFactory: () => "invalid-lock-restore"
-  });
+  const manager = createDataRecoveryManager({ dataRoot });
+  const lockIdentity = lstatSync(lockRoot);
 
   const freshError = captureError(() => manager.restore(selectedId));
 
   assert.equal(freshError.statusCode, 423);
-  assert.equal(freshError.code, "restore-locked");
+  assert.equal(freshError.code, "restore-lock-invalid");
   assert.equal(freshError.message.includes(parent), false);
   assert.equal(existsSync(lockRoot), true);
   const oldTime = new Date(Date.now() - 10 * 60 * 1000);
   utimesSync(lockRoot, oldTime, oldTime);
 
-  const result = manager.restore(selectedId);
+  const staleError = captureError(() => manager.restore(selectedId));
 
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
-  assert.equal(existsSync(lockRoot), false);
+  assert.equal(staleError.statusCode, 423);
+  assert.equal(staleError.code, "restore-lock-invalid");
+  assert.equal(staleError.message.includes(parent), false);
+  assert.equal(existsSync(lockRoot), true);
+  assert.deepEqual(readFileSync(lockRoot), Buffer.alloc(0));
+  assert.equal(lstatSync(lockRoot).dev, lockIdentity.dev);
+  assert.equal(lstatSync(lockRoot).ino, lockIdentity.ino);
   assert.equal(existsSync(source.rootDir), true);
 });
 
-test("recovery lock release failure is retryable and does not wedge later managers", (t) => {
+test("committed recovery reports lock release warning and retries before another restore", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
   const selectedId = snapshotId(source.basename);
   const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
   let lockReleaseCalls = 0;
+  let restoreTokenCalls = 0;
   const firstManager = createDataRecoveryManager({
     dataRoot,
     lockTokenFactory: () => "release-retry-lock",
-    tokenFactory: () => "release-retry-restore",
+    tokenFactory() {
+      restoreTokenCalls += 1;
+      return "release-retry-restore";
+    },
     unlink(target) {
       if (target === lockRoot) {
         lockReleaseCalls += 1;
-        if (lockReleaseCalls === 1) {
+        if (lockReleaseCalls <= 2) {
           throw new Error(`release failed at ${parent}`);
         }
       }
@@ -323,14 +341,23 @@ test("recovery lock release failure is retryable and does not wedge later manage
     }
   });
 
-  const releaseError = captureError(() => firstManager.restore(selectedId));
+  const result = firstManager.restore(selectedId);
 
-  assert.equal(releaseError.statusCode, 500);
-  assert.equal(releaseError.code, "restore-lock-release-failed");
-  assert.equal(releaseError.message.includes(parent), false);
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.equal(path.isAbsolute(result.preRestoreBackup), false);
+  assert.deepEqual(result.warnings, [{
+    code: "restore-lock-release-pending",
+    message: "Recovery completed, but its lock still needs cleanup."
+  }]);
   assert.equal(lstatSync(lockRoot).isFile(), true);
+  const retryError = captureError(() => firstManager.restore(selectedId));
+  assert.equal(retryError.statusCode, 423);
+  assert.equal(retryError.code, "restore-lock-release-pending");
+  assert.equal(retryError.message.includes(parent), false);
+  assert.equal(restoreTokenCalls, 1);
+  assert.equal(existsSync(lockRoot), true);
   firstManager.dispose();
-  assert.equal(lockReleaseCalls, 2);
+  assert.equal(lockReleaseCalls, 3);
   assert.equal(existsSync(lockRoot), false);
 
   const secondManager = createDataRecoveryManager({
@@ -338,9 +365,59 @@ test("recovery lock release failure is retryable and does not wedge later manage
     lockTokenFactory: () => "later-manager-lock",
     tokenFactory: () => "later-manager-restore"
   });
-  const result = secondManager.restore(selectedId);
-  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  const laterResult = secondManager.restore(selectedId);
+  assert.deepEqual(laterResult.registry, validateDataRoot(dataRoot));
   assert.equal(existsSync(lockRoot), false);
+});
+
+test("committed recovery never removes a replacement lock after ownership is lost", (t) => {
+  const { parent, dataRoot } = makeDataRoot(t);
+  const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
+  const selectedId = snapshotId(source.basename);
+  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
+  let restoreTokenCalls = 0;
+  const manager = createDataRecoveryManager({
+    dataRoot,
+    lockTokenFactory: () => "lost-release-lock",
+    tokenFactory() {
+      restoreTokenCalls += 1;
+      return "lost-release-restore";
+    },
+    validate(rootDir) {
+      const registry = validateDataRoot(rootDir);
+      if (rootDir === dataRoot) {
+        unlinkSync(lockRoot);
+        writeFileSync(
+          lockRoot,
+          `${JSON.stringify({ pid: process.pid, token: "replacement-lock" })}\n`,
+          { flag: "wx", mode: 0o600 }
+        );
+      }
+      return registry;
+    }
+  });
+
+  const result = manager.restore(selectedId);
+
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.deepEqual(result.warnings, [{
+    code: "restore-lock-release-pending",
+    message: "Recovery completed, but its lock still needs cleanup."
+  }]);
+  const replacementBytes = readFileSync(lockRoot);
+  const replacementIdentity = lstatSync(lockRoot);
+  const retryError = captureError(() => manager.restore(selectedId));
+  assert.equal(retryError.statusCode, 423);
+  assert.equal(retryError.code, "restore-lock-release-pending");
+  assert.equal(restoreTokenCalls, 1);
+  assert.deepEqual(readFileSync(lockRoot), replacementBytes);
+  assert.equal(lstatSync(lockRoot).dev, replacementIdentity.dev);
+  assert.equal(lstatSync(lockRoot).ino, replacementIdentity.ino);
+  const disposeError = captureError(() => manager.dispose());
+  assert.equal(disposeError.code, "restore-lock-release-failed");
+  assert.deepEqual(readFileSync(lockRoot), replacementBytes);
+  assert.equal(lstatSync(lockRoot).dev, replacementIdentity.dev);
+  assert.equal(lstatSync(lockRoot).ino, replacementIdentity.ino);
 });
 
 test("recovery releases a partially acquired lock after claimed-owner verification fails", (t) => {
@@ -513,7 +590,7 @@ test("reports restoring only inside transaction callbacks and dispose cannot rem
   assert.equal(existsSync(unrelatedStaging), true);
 });
 
-test("restore cleans only owned staging when copy or staging validation fails", (t) => {
+test("restore preserves owned staging when copy or staging validation fails", (t) => {
   for (const failure of ["copy", "validation"]) {
     const { parent, dataRoot } = makeDataRoot(t);
     writeFileSync(path.join(dataRoot, "assets/photo.svg"), `<svg>official-${failure}</svg>`);
@@ -558,15 +635,29 @@ test("restore cleans only owned staging when copy or staging validation fails", 
     );
     assert.equal(error.message.includes(parent), false);
     assert.equal(manager.isRestoring(), false);
-    assert.deepEqual(readdirSync(parent).sort(), entriesBefore);
+    assert.deepEqual(
+      readdirSync(parent).sort(),
+      [...entriesBefore, path.basename(stagingRoot)].sort()
+    );
     assert.deepEqual(readFileSync(path.join(dataRoot, "assets/photo.svg")), officialBefore);
     assert.deepEqual(readFileSync(path.join(source.rootDir, "assets/photo.svg")), sourceBefore);
     assert.deepEqual(readFileSync(path.join(otherSnapshot.rootDir, "resumes.json")), otherBefore);
-    assert.deepEqual(removeCalls, [{
-      target: stagingRoot,
-      options: { force: true, recursive: true }
-    }]);
+    assert.equal(validateDataRoot(stagingRoot).activeId, fixtureRegistry.activeId);
+    assert.deepEqual(removeCalls, []);
+    manager.dispose();
+    assert.equal(existsSync(stagingRoot), true);
+    assert.deepEqual(removeCalls, []);
   }
+});
+
+test("production recovery has no recursive staging deletion path", () => {
+  const source = readFileSync(
+    new URL("./data-recovery.mjs", import.meta.url),
+    "utf8"
+  );
+
+  assert.doesNotMatch(source, /\brmSync\b/);
+  assert.doesNotMatch(source, /options\.remove/);
 });
 
 test("restore rolls back the old root when publishing staging fails", (t) => {
@@ -608,7 +699,8 @@ test("restore rolls back the old root when publishing staging fails", (t) => {
   );
   assert.equal(existsSync(`${dataRoot}.pre-restore-20260711-080910`), false);
   assert.equal(existsSync(source.rootDir), true);
-  assert.deepEqual(removeCalls, [stagingRoot]);
+  assert.equal(existsSync(stagingRoot), true);
+  assert.deepEqual(removeCalls, []);
   assert.equal(manager.isRestoring(), false);
 });
 
@@ -829,15 +921,17 @@ test("restore rollback failure preserves every surviving root and reports manual
     readFileSync(path.join(source.rootDir, "assets/photo.svg"), "utf8"),
     "<svg>selected-source</svg>"
   );
-  assert.deepEqual(removeCalls, [stagingRoot]);
+  assert.equal(existsSync(stagingRoot), true);
+  assert.deepEqual(removeCalls, []);
   assert.equal(manager.isRestoring(), false);
 });
 
-test("restore preserves rollback failure when staging cleanup also fails", (t) => {
+test("restore preserves rollback failure when lock release also fails", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
   const backupRoot = `${dataRoot}.pre-restore-20260711-080910`;
   const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-priority-token`);
+  const lockRoot = path.join(parent, `.${path.basename(dataRoot)}.recovery-lock`);
   let renameCalls = 0;
   const manager = createDataRecoveryManager({
     dataRoot,
@@ -854,8 +948,11 @@ test("restore preserves rollback failure when staging cleanup also fails", (t) =
       }
       throw new Error(`rollback failed at ${parent}`);
     },
-    remove() {
-      throw new Error(`cleanup failed at ${parent}`);
+    unlink(target) {
+      if (target === lockRoot) {
+        throw new Error(`lock release failed at ${parent}`);
+      }
+      unlinkSync(target);
     }
   });
 
@@ -869,40 +966,35 @@ test("restore preserves rollback failure when staging cleanup also fails", (t) =
   assert.equal(existsSync(dataRoot), false);
   assert.equal(existsSync(backupRoot), true);
   assert.equal(existsSync(stagingRoot), true);
+  assert.equal(existsSync(lockRoot), true);
   assert.equal(existsSync(source.rootDir), true);
   assert.equal(manager.isRestoring(), false);
 });
 
-test("restore retains failed staging cleanup ownership until dispose retries it", (t) => {
+test("restore preserves failed staging and uses a unique path on deterministic retry", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
-  const tokens = ["pending-cleanup-token", "after-dispose-token"];
   const pendingStaging = path.join(
     parent,
     `.${path.basename(dataRoot)}.restore-pending-cleanup-token`
   );
+  const retryStaging = `${pendingStaging}-2`;
   let copyCalls = 0;
-  let removeCalls = 0;
   let tokenCalls = 0;
+  const copyTargets = [];
   const manager = createDataRecoveryManager({
     dataRoot,
     tokenFactory() {
       tokenCalls += 1;
-      return tokens.shift();
+      return "pending-cleanup-token";
     },
     copy(sourceRoot, targetRoot, options) {
       copyCalls += 1;
+      copyTargets.push(targetRoot);
       cpSync(sourceRoot, targetRoot, options);
       if (copyCalls === 1) {
         throw new Error(`copy failed at ${parent}`);
       }
-    },
-    remove(target, options) {
-      removeCalls += 1;
-      if (removeCalls === 1) {
-        throw new Error(`cleanup failed at ${parent}`);
-      }
-      rmSync(target, options);
     }
   });
   const selectedId = snapshotId(source.basename);
@@ -914,33 +1006,30 @@ test("restore retains failed staging cleanup ownership until dispose retries it"
   assert.equal(validateDataRoot(pendingStaging).activeId, fixtureRegistry.activeId);
   const pendingIdentity = lstatSync(pendingStaging);
 
-  const retryError = captureError(() => manager.restore(selectedId));
-  assert.equal(retryError.statusCode, 423);
-  assert.equal(retryError.code, "restore-cleanup-pending");
-  assert.equal(retryError.message.includes(parent), false);
-  assert.equal(tokenCalls, 1);
+  manager.dispose();
+  assert.equal(existsSync(pendingStaging), true);
   assert.equal(lstatSync(pendingStaging).dev, pendingIdentity.dev);
   assert.equal(lstatSync(pendingStaging).ino, pendingIdentity.ino);
 
-  manager.dispose();
-
-  assert.equal(removeCalls, 2);
-  assert.equal(existsSync(pendingStaging), false);
   const result = manager.restore(selectedId);
   assert.deepEqual(result.registry, validateDataRoot(dataRoot));
   assert.equal(tokenCalls, 2);
+  assert.deepEqual(copyTargets, [pendingStaging, retryStaging]);
+  assert.equal(existsSync(pendingStaging), true);
+  assert.equal(lstatSync(pendingStaging).dev, pendingIdentity.dev);
+  assert.equal(lstatSync(pendingStaging).ino, pendingIdentity.ino);
+  assert.equal(existsSync(retryStaging), false);
   assert.equal(manager.isRestoring(), false);
 });
 
-test("restore keeps its lock active through injected staging cleanup", (t) => {
+test("restore keeps its lock active while failed staging ownership is abandoned", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
   const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-cleanup-lock-token`);
   let manager;
   let selectedId;
-  let removeCalls = 0;
   let tokenCalls = 0;
-  let restoringDuringRemove;
+  let restoringDuringRelease;
   let stagingExistsAfterDispose;
   let nestedError;
   manager = createDataRecoveryManager({
@@ -956,17 +1045,14 @@ test("restore keeps its lock active through injected staging cleanup", (t) => {
       cpSync(sourceRoot, targetRoot, options);
       throw new Error(`copy failed at ${parent}`);
     },
-    remove(target, options) {
-      removeCalls += 1;
-      if (removeCalls === 1) {
-        restoringDuringRemove = manager.isRestoring();
+    unlink(target) {
+      if (target.endsWith(".recovery-lock")) {
+        restoringDuringRelease = manager.isRestoring();
         manager.dispose();
-        stagingExistsAfterDispose = existsSync(target);
+        stagingExistsAfterDispose = existsSync(stagingRoot);
         nestedError = captureError(() => manager.restore(selectedId));
       }
-      if (existsSync(target)) {
-        rmSync(target, options);
-      }
+      unlinkSync(target);
     }
   });
   selectedId = snapshotId(source.basename);
@@ -975,18 +1061,17 @@ test("restore keeps its lock active through injected staging cleanup", (t) => {
 
   assert.equal(error.code, "restore-copy-failed");
   assert.equal(error.message.includes(parent), false);
-  assert.equal(restoringDuringRemove, true);
+  assert.equal(restoringDuringRelease, true);
   assert.equal(stagingExistsAfterDispose, true);
   assert.equal(nestedError.statusCode, 423);
   assert.equal(nestedError.code, "restore-locked");
   assert.equal(nestedError.message.includes(parent), false);
-  assert.equal(removeCalls, 1);
   assert.equal(tokenCalls, 1);
-  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(existsSync(stagingRoot), true);
   assert.equal(manager.isRestoring(), false);
 });
 
-test("restore rejects unsafe tokens and never claims an existing staging directory", (t) => {
+test("restore rejects unsafe tokens and allocates beside an existing staging directory", (t) => {
   const { parent, dataRoot } = makeDataRoot(t);
   const source = writeSnapshot(dataRoot, "pre-import-20260710-070809");
   const initialEntries = readdirSync(parent).sort();
@@ -1005,24 +1090,30 @@ test("restore rejects unsafe tokens and never claims an existing staging directo
   const stagingRoot = path.join(parent, `.${path.basename(dataRoot)}.restore-existing-token`);
   mkdirSync(stagingRoot);
   writeFileSync(path.join(stagingRoot, "sentinel.txt"), "not manager owned");
+  const nextStagingRoot = `${stagingRoot}-2`;
   const removeCalls = [];
+  const copyTargets = [];
   const existingManager = createDataRecoveryManager({
     dataRoot,
     tokenFactory: () => "existing-token",
+    copy(sourceRoot, targetRoot, options) {
+      copyTargets.push(targetRoot);
+      cpSync(sourceRoot, targetRoot, options);
+    },
     remove(target, options) {
       removeCalls.push(target);
       rmSync(target, options);
     }
   });
 
-  const existingError = captureError(
-    () => existingManager.restore(snapshotId(source.basename))
-  );
-  assert.equal(existingError.code, "restore-staging-exists");
-  assert.equal(existingError.message.includes(parent), false);
+  const result = existingManager.restore(snapshotId(source.basename));
+
+  assert.deepEqual(result.registry, validateDataRoot(dataRoot));
+  assert.deepEqual(copyTargets, [nextStagingRoot]);
   existingManager.dispose();
   assert.equal(readFileSync(path.join(stagingRoot, "sentinel.txt"), "utf8"), "not manager owned");
   assert.deepEqual(removeCalls, []);
+  assert.equal(existsSync(nextStagingRoot), false);
   assert.equal(existsSync(dataRoot), true);
   assert.equal(existsSync(source.rootDir), true);
 });
@@ -1095,7 +1186,7 @@ test("restore requires staging to be an exact regular-tree copy", (t) => {
     readFileSync(path.join(source.rootDir, "assets/photo.svg"), "utf8"),
     "<svg>selected-source</svg>"
   );
-  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(existsSync(stagingRoot), true);
   assert.equal(manager.isRestoring(), false);
 });
 
@@ -1127,7 +1218,7 @@ test("restore rejects source mutation during the staged copy", (t) => {
     readFileSync(path.join(source.rootDir, "assets/photo.svg"), "utf8"),
     "<svg>source-mutated</svg>"
   );
-  assert.equal(existsSync(stagingRoot), false);
+  assert.equal(existsSync(stagingRoot), true);
   assert.equal(manager.isRestoring(), false);
 });
 
