@@ -188,6 +188,35 @@ async function dispatchBeforeUnload(page) {
   });
 }
 
+async function installControlledLayoutMeasurements(page, overflowByBodySize) {
+  await page.addInitScript((overflowMap) => {
+    const original = Element.prototype.getBoundingClientRect;
+    Element.prototype.getBoundingClientRect = function controlledLayoutRect() {
+      if (this.id === "resume-page") {
+        return {
+          x: 0, y: 0, top: 0, left: 0,
+          right: 794, bottom: 1123, width: 794, height: 1123,
+          toJSON() { return this; }
+        };
+      }
+      if (this.closest?.("#resume-page")) {
+        const bodySize = document.documentElement.style.getPropertyValue("--body-size").trim();
+        const overflow = Number(overflowMap[bodySize] || 0);
+        if (this.matches("[data-path='profile.name']")) {
+          window.parent.__layoutMeasurements ||= [];
+          window.parent.__layoutMeasurements.push(bodySize);
+        }
+        return {
+          x: 20, y: 20, top: 20, left: 20,
+          right: 760, bottom: 1123 + overflow, width: 740, height: 1103 + overflow,
+          toJSON() { return this; }
+        };
+      }
+      return original.call(this);
+    };
+  }, overflowByBodySize);
+}
+
 const validResume = {
   profile: {
     name: "测试候选人",
@@ -443,6 +472,7 @@ test("editor server serves the local editor shell", async (t) => {
   assert.match(html, /简历编辑器/);
   assert.match(html, /id="app"/);
   assert.match(html, /id="previewFrame"/);
+  assert.match(html, /A4 待测量/);
   assert.doesNotMatch(html, /id="previewImage"/);
 });
 
@@ -962,6 +992,15 @@ test("editor protects edits, saves with keyboard shortcuts, and generates the la
       return {
         density: "tight",
         metrics: { height: 1000 },
+        layout: {
+          mode: "fixed",
+          fontSizePt: 10.3,
+          lineHeight: 1.27,
+          spacingLevel: 35,
+          marginPreset: "narrow",
+          cssVariables: { "--body-size": "10.3pt" }
+        },
+        overflow: { vertical: 0, horizontal: 0, total: 0 },
         outputPaths: {
           preview: previewPath,
           pdf: path.join(rootDir, "output/resume.pdf"),
@@ -1047,6 +1086,8 @@ test("editor protects edits, saves with keyboard shortcuts, and generates the la
   });
   assert.equal(await page.textContent("#generateButton"), "重新生成预览");
   assert.match(await page.textContent("#messageLine"), /预览已更新/);
+  assert.match(await page.textContent("#statusStrip"), /固定.*10\.3pt.*行距 1\.27.*较紧.*窄边距/);
+  assert.match(await page.textContent("#statusStrip"), /A4 单页/);
 });
 
 test("editor renders unsaved edits in a debounced draft preview without writing files", async (t) => {
@@ -1086,6 +1127,105 @@ test("editor renders unsaved edits in a debounced draft preview without writing 
   assert.equal(readFileSync(previewPath, "utf8"), generatedPreview);
 });
 
+test("draft preview applies layout candidates in order and selects the first A4 fit", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  await installControlledLayoutMeasurements(page, {
+    "11.2pt": 24,
+    "10.8pt": 0
+  });
+  await page.route("**/api/preview", async (route) => {
+    const body = route.request().postDataJSON();
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        resumeId: "cpp",
+        html: renderResumeHtml(body.resume, { density: "custom", cssPath: "/templates/resume.css" }),
+        layout: {
+          mode: "auto",
+          candidates: [
+            {
+              mode: "auto", fontSizePt: 11.2, lineHeight: 1.4, spacingLevel: 80, marginPreset: "normal",
+              cssVariables: { "--body-size": "11.2pt", "--body-line-height": "1.4" }
+            },
+            {
+              mode: "auto", fontSizePt: 10.8, lineHeight: 1.32, spacingLevel: 50, marginPreset: "normal",
+              cssVariables: { "--body-size": "10.8pt", "--body-line-height": "1.32" }
+            }
+          ]
+        }
+      })
+    });
+  });
+
+  await page.goto(app.url);
+  await page.fill("[data-path='profile.name']", "候选适配测试");
+  await page.waitForFunction(() => {
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return status.includes("10.8pt") && status.includes("A4 单页");
+  });
+
+  assert.deepEqual(await page.evaluate(() => window.__layoutMeasurements), ["11.2pt", "10.8pt"]);
+  assert.match(await page.textContent("#statusStrip"), /自动.*10\.8pt.*行距 1\.32.*较紧.*标准边距/);
+});
+
+test("fixed draft overflow allows saving but gates generation until the draft fits", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  let fitting = false;
+  await installControlledLayoutMeasurements(page, {
+    "10.6pt": 38,
+    "10.5pt": 0
+  });
+  await page.route("**/api/preview", async (route) => {
+    const body = route.request().postDataJSON();
+    const fontSizePt = fitting ? 10.5 : 10.6;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        resumeId: "cpp",
+        html: renderResumeHtml(body.resume, { density: "custom", cssPath: "/templates/resume.css" }),
+        layout: {
+          mode: "fixed",
+          candidates: [{
+            mode: "fixed", fontSizePt, lineHeight: 1.3, spacingLevel: 50, marginPreset: "narrow",
+            cssVariables: { "--body-size": `${fontSizePt}pt`, "--body-line-height": "1.3" }
+          }]
+        }
+      })
+    });
+  });
+
+  await page.goto(app.url);
+  await page.click("[data-area='layout']");
+  await page.click("[data-action='set-layout-mode'][data-layout-value='fixed']");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("超出 A4 38px"));
+  assert.equal(await page.locator("#saveButton").isDisabled(), false);
+  assert.equal(await page.locator("#generateButton").isDisabled(), true);
+
+  await page.click("#saveButton");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("已保存"));
+  assert.equal(await page.locator("#saveButton").isDisabled(), true);
+  assert.equal(await page.locator("#generateButton").isDisabled(), true);
+
+  fitting = true;
+  await page.click("[data-area='content']");
+  await page.fill("[data-path='profile.name']", "恢复为单页");
+  await page.waitForFunction(() => {
+    const status = document.querySelector("#statusStrip")?.textContent || "";
+    return status.includes("10.5pt") && status.includes("A4 单页");
+  });
+  await page.click("#saveButton");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("已保存"));
+  assert.equal(await page.locator("#generateButton").isDisabled(), false);
+});
+
 test("editor ignores a slower draft response after a newer edit", async (t) => {
   const previewRequests = [];
   const app = await startCustomEditorServer(async (request, response, url) => {
@@ -1108,13 +1248,25 @@ test("editor ignores a slower draft response after a newer edit", async (t) => {
       if (name === "较慢的第一版") {
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
+      const fontSizePt = name === "较慢的第一版" ? 11.2 : 10.4;
       sendTestJson(response, 200, {
         ok: true,
         html: renderResumeHtml(body.resume, {
           density: "normal",
           cssPath: "/templates/resume.css",
           assetPrefix: "/"
-        })
+        }),
+        layout: {
+          mode: "fixed",
+          candidates: [{
+            mode: "fixed",
+            fontSizePt,
+            lineHeight: 1.3,
+            spacingLevel: 50,
+            marginPreset: "normal",
+            cssVariables: { "--body-size": `${fontSizePt}pt`, "--body-line-height": "1.3" }
+          }]
+        }
       });
       return true;
     }
@@ -1139,6 +1291,8 @@ test("editor ignores a slower draft response after a newer edit", async (t) => {
   const previewName = await page.frameLocator("#previewFrame").locator("[data-path='profile.name']").textContent();
   assert.match(previewName, /最终的第二版/);
   assert.deepEqual(previewRequests, ["较慢的第一版", "最终的第二版"]);
+  assert.match(await page.textContent("#statusStrip"), /10\.4pt/);
+  assert.doesNotMatch(await page.textContent("#statusStrip"), /11\.2pt/);
 });
 
 test("editor previews section reordering without saving yaml", async (t) => {

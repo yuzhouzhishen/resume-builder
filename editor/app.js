@@ -69,8 +69,21 @@ const layoutNumberFields = Object.freeze({
   spacingLevel: Object.freeze({ label: "内容间距", min: 0, max: 100, step: 1, unit: "", precision: 0 })
 });
 const draftPreviewDelayMs = 300;
-const draftDensityNames = ["normal", "compact", "tight"];
 const fitTolerancePx = 2;
+const allowedLayoutCssVariables = new Set([
+  "--page-x",
+  "--page-y",
+  "--body-size",
+  "--body-line-height",
+  "--item-gap",
+  "--section-gap",
+  "--experience-gap",
+  "--bullet-indent",
+  "--profile-size",
+  "--section-title-size",
+  "--skill-title-size",
+  "--experience-title-size"
+]);
 const previewPageSize = {
   width: 794,
   height: 1123,
@@ -237,6 +250,8 @@ function markDirty() {
   state.dirty = true;
   state.saveState = "unsaved";
   state.generation = "needs generate";
+  state.effectiveLayout = null;
+  state.layoutOverflow = null;
   scheduleDraftPreview();
 }
 
@@ -361,22 +376,64 @@ function nextPreviewFrame(documentInFrame) {
   return new Promise((resolve) => documentInFrame.defaultView.requestAnimationFrame(resolve));
 }
 
-async function selectDraftDensity() {
+function fallbackLayoutCandidate() {
+  return {
+    mode: state.resume.layout.mode,
+    fontSizePt: state.resume.layout.fontSizePt,
+    lineHeight: state.resume.layout.lineHeight,
+    spacingLevel: state.resume.layout.spacingLevel,
+    marginPreset: state.resume.layout.marginPreset,
+    cssVariables: {}
+  };
+}
+
+function previewLayoutCandidates(payload) {
+  if (!Array.isArray(payload?.candidates) || payload.candidates.length === 0) {
+    return [fallbackLayoutCandidate()];
+  }
+  return payload.candidates.map((candidate) => ({
+    mode: candidate.mode,
+    fontSizePt: candidate.fontSizePt,
+    lineHeight: candidate.lineHeight,
+    spacingLevel: candidate.spacingLevel,
+    marginPreset: candidate.marginPreset,
+    cssVariables: Object.fromEntries(Object.entries(candidate.cssVariables || {}).filter(([name, value]) => (
+      allowedLayoutCssVariables.has(name) && typeof value === "string"
+    )))
+  }));
+}
+
+function applyLayoutCandidate(documentInFrame, candidate) {
+  const rootStyle = documentInFrame.documentElement.style;
+  for (const name of allowedLayoutCssVariables) {
+    rootStyle.removeProperty(name);
+  }
+  for (const [name, value] of Object.entries(candidate.cssVariables)) {
+    rootStyle.setProperty(name, value);
+  }
+  documentInFrame.body.dataset.layoutMode = candidate.mode;
+}
+
+async function selectDraftLayout() {
   const documentInFrame = previewDocument();
   if (!documentInFrame?.querySelector("#resume-page")) {
     return null;
   }
 
   let lastResult = null;
-  for (const density of draftDensityNames) {
-    documentInFrame.body.dataset.density = density;
+  for (const candidate of state.layoutCandidates) {
+    applyLayoutCandidate(documentInFrame, candidate);
     await nextPreviewFrame(documentInFrame);
     const metrics = measurePreviewContent(documentInFrame);
     const verticalOverflow = Math.max(0, metrics.height - metrics.pageHeight);
     const horizontalOverflow = Math.max(0, metrics.width - metrics.pageWidth);
-    const overflow = Math.max(verticalOverflow, horizontalOverflow);
-    lastResult = { density, metrics, overflow };
-    if (overflow <= fitTolerancePx) {
+    const overflow = {
+      vertical: verticalOverflow,
+      horizontal: horizontalOverflow,
+      total: Math.max(verticalOverflow, horizontalOverflow)
+    };
+    lastResult = { candidate, metrics, overflow };
+    if (overflow.total <= fitTolerancePx) {
       return lastResult;
     }
   }
@@ -415,6 +472,7 @@ async function renderDraftPreview(version) {
       return;
     }
 
+    state.layoutCandidates = previewLayoutCandidates(body.layout);
     state.previewSource = "draft";
     state.draftPreview = "loading";
     elements.preview.srcdoc = body.html;
@@ -1428,6 +1486,42 @@ function renderTabs() {
   `;
 }
 
+function nearestSpacingLabel(level) {
+  const anchors = [
+    [0, "紧凑"],
+    [50, "较紧"],
+    [67, "标准"],
+    [100, "宽松"]
+  ];
+  return anchors.reduce((nearest, current) => (
+    Math.abs(level - current[0]) < Math.abs(level - nearest[0]) ? current : nearest
+  ))[1];
+}
+
+function effectiveLayoutLabel() {
+  const layout = state.effectiveLayout;
+  if (!layout) {
+    return state.density !== "--" ? `密度：${state.density}` : "排版：待测量";
+  }
+  const marginLabels = { narrow: "窄边距", normal: "标准边距", wide: "宽边距" };
+  return [
+    layout.mode === "fixed" ? "固定" : "自动",
+    `${layout.fontSizePt}pt`,
+    `行距 ${layout.lineHeight}`,
+    nearestSpacingLabel(layout.spacingLevel),
+    marginLabels[layout.marginPreset] || layout.marginPreset
+  ].join(" · ");
+}
+
+function a4LayoutLabel() {
+  if (!state.layoutOverflow) {
+    return "A4 待测量";
+  }
+  return state.layoutOverflow.total > fitTolerancePx
+    ? `超出 A4 ${state.layoutOverflow.total}px`
+    : "A4 单页";
+}
+
 function renderStatus() {
   const busy = isBusy();
   const saveClass = state.dirty ? "is-dirty" : "is-ok";
@@ -1453,8 +1547,8 @@ function renderStatus() {
       ? "is-error"
       : "";
   elements.status.innerHTML = [
-    `<span>密度：${escapeHtml(state.density)}</span>`,
-    "<span>A4 单页</span>",
+    `<span>${escapeHtml(effectiveLayoutLabel())}</span>`,
+    `<span>${escapeHtml(a4LayoutLabel())}</span>`,
     `<span class="${saveClass}">${state.dirty ? "未保存" : "已保存"}</span>`,
     `<span class="${generationClass}">${escapeHtml(generationLabel)}</span>`
   ].join("");
@@ -1462,9 +1556,12 @@ function renderStatus() {
   elements.message.textContent = state.message;
   elements.save.disabled = !state.resume || !state.dirty || busy;
   elements.save.textContent = state.busyAction === "saving" ? "保存中" : "保存";
-  elements.generate.disabled = !state.resume || state.dirty || state.generation === "generating" || busy;
+  const layoutOverflows = state.layoutOverflow?.total > fitTolerancePx;
+  elements.generate.disabled = !state.resume || state.dirty || layoutOverflows || state.generation === "generating" || busy;
   elements.generate.textContent = state.dirty
     ? "保存后生成"
+    : layoutOverflows
+      ? "内容超出 A4"
     : state.generation === "generated" || state.generation === "loaded"
       ? "重新生成预览"
       : state.generation === "generating"
@@ -2337,6 +2434,8 @@ async function generateResume() {
       body: JSON.stringify({ resumeId: state.activeResumeId })
     });
     state.density = body.density || "--";
+    state.effectiveLayout = body.layout || null;
+    state.layoutOverflow = body.overflow || { vertical: 0, horizontal: 0, total: 0 };
     state.generation = "generated";
     refreshGeneratedPreview();
     setMessage(`预览已更新，PDF 已生成，内容高度 ${body.contentHeight}px`, "ok");
@@ -2714,17 +2813,19 @@ elements.preview.addEventListener("load", async () => {
   fitPreviewFrame();
   markPreviewSelection();
   if (state.previewSource === "draft") {
-    const selected = await selectDraftDensity();
+    const selected = await selectDraftLayout();
     if (!selected || state.previewSource !== "draft") {
       return;
     }
 
     const pendingMessage = state.pendingDraftPreviewMessage;
     state.pendingDraftPreviewMessage = "";
-    state.density = selected.density;
-    if (selected.overflow > fitTolerancePx) {
+    state.effectiveLayout = selected.candidate;
+    state.layoutOverflow = selected.overflow;
+    state.density = "custom";
+    if (selected.overflow.total > fitTolerancePx) {
       state.draftPreview = "overflow";
-      const overflowMessage = `草稿预览在 tight 档仍超出 ${selected.overflow}px，请缩短最长模块或减少 1-2 条要点。`;
+      const overflowMessage = `草稿预览超出 ${selected.overflow.total}px，请缩短最长模块或调整排版设置。`;
       setMessage(pendingMessage ? `${pendingMessage}；${overflowMessage}` : overflowMessage, "error");
       return;
     }
