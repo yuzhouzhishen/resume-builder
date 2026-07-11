@@ -18,6 +18,7 @@ test("CI runs the complete local gate with least privilege", () => {
 
   assert.deepEqual(workflow.permissions, { contents: "read" });
   assert.ok(Object.hasOwn(workflow.on, "push"));
+  assert.deepEqual(workflow.on.push.branches, ["main"]);
   assert.ok(Object.hasOwn(workflow.on, "pull_request"));
   assert.equal(workflow.concurrency["cancel-in-progress"], true);
   assert.equal(job["runs-on"], "ubuntu-latest");
