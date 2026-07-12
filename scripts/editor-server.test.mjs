@@ -1243,6 +1243,83 @@ test("editor removes a corrupt browser-local draft without blocking initializati
   assert.equal(await reopenedPage.evaluate((key) => localStorage.getItem(key), draftKey), null);
 });
 
+test("editor undo and redo coalesce text edits and follow the saved baseline", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const draftKey = "resume-builder:local-draft:v1:cpp";
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  assert.equal(await page.locator("#undoButton").count(), 1);
+  assert.equal(await page.locator("#redoButton").count(), 1);
+  assert.equal(await page.locator("#undoButton").getAttribute("aria-label"), "撤销");
+  assert.equal(await page.locator("#redoButton").getAttribute("aria-label"), "重做");
+  assert.equal(await page.locator("#undoButton").isDisabled(), true);
+  assert.equal(await page.locator("#redoButton").isDisabled(), true);
+
+  const nameInput = page.locator("[data-path='profile.name']");
+  await nameInput.selectText();
+  await page.keyboard.type("编辑历史姓名", { delay: 20 });
+  await page.waitForFunction(() => !document.querySelector("#undoButton")?.disabled);
+  assert.equal(await page.locator("#redoButton").isDisabled(), true);
+
+  await page.click("#undoButton");
+  await page.waitForFunction((name) => document.querySelector("[data-path='profile.name']")?.value === name, validResume.profile.name);
+  assert.equal(await page.locator("#undoButton").isDisabled(), true);
+  assert.equal(await page.locator("#redoButton").isDisabled(), false);
+  assert.match(await page.textContent("#statusStrip"), /已保存/);
+  await page.waitForFunction((key) => localStorage.getItem(key) === null, draftKey);
+
+  await page.click("#redoButton");
+  await page.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "编辑历史姓名");
+  assert.match(await page.textContent("#statusStrip"), /未保存/);
+  await page.waitForFunction((key) => JSON.parse(localStorage.getItem(key) || "null")?.resume?.profile?.name === "编辑历史姓名", draftKey);
+
+  await page.click("#saveButton");
+  await page.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("已保存"));
+  await page.click("#undoButton");
+  await page.waitForFunction((name) => document.querySelector("[data-path='profile.name']")?.value === name, validResume.profile.name);
+  assert.match(await page.textContent("#statusStrip"), /未保存/);
+  await page.click("#redoButton");
+  await page.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "编辑历史姓名");
+  assert.match(await page.textContent("#statusStrip"), /已保存/);
+});
+
+test("editor history covers structural and layout edits and clears redo after a new edit", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.click("[data-module='skills']");
+  const originalSkillCount = await page.locator(".item-block").count();
+  await page.click("[data-action='add-skill']");
+  assert.equal(await page.locator(".item-block").count(), originalSkillCount + 1);
+
+  await page.keyboard.press("Control+Z");
+  await page.waitForFunction((count) => document.querySelectorAll(".item-block").length === count, originalSkillCount);
+  await page.keyboard.press("Control+Y");
+  await page.waitForFunction((count) => document.querySelectorAll(".item-block").length === count + 1, originalSkillCount);
+  await page.keyboard.press("Control+Z");
+
+  await page.click("[data-module='profile']");
+  await page.fill("[data-path='profile.name']", "新的分支修改");
+  assert.equal(await page.locator("#redoButton").isDisabled(), true);
+
+  await page.click("[data-area='layout']");
+  const originalFontSize = await page.inputValue("input[data-layout-field='fontSizePt']");
+  await page.click("[data-action='step-layout'][data-layout-field='fontSizePt'][data-direction='-1']");
+  assert.notEqual(await page.inputValue("input[data-layout-field='fontSizePt']"), originalFontSize);
+  await page.keyboard.press("Control+Z");
+  await page.waitForFunction((value) => document.querySelector("input[data-layout-field='fontSizePt']")?.value === value, originalFontSize);
+  await page.keyboard.press("Control+Shift+Z");
+  await page.waitForFunction((value) => document.querySelector("input[data-layout-field='fontSizePt']")?.value !== value, originalFontSize);
+});
+
 test("draft preview applies layout candidates in order and selects the first A4 fit", async (t) => {
   const rootDir = makeApiFixture();
   const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });

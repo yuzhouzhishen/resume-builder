@@ -111,6 +111,22 @@ button:disabled {
   flex: 0 0 auto;
 }
 
+.edit-history-controls {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+}
+
+.edit-history-button {
+  font-size: 19px;
+}
+
+.edit-history-button:disabled {
+  color: var(--muted-soft);
+  background: var(--surface);
+}
+
 .toolbar-command-button {
   height: 34px;
   min-height: 34px;

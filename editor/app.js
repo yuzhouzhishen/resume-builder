@@ -70,6 +70,8 @@ const layoutNumberFields = Object.freeze({
 });
 const draftPreviewDelayMs = 300;
 const localDraftWriteDelayMs = 150;
+const editHistoryMergeDelayMs = 600;
+const editHistoryLimit = 50;
 const localDraftVersion = 1;
 const localDraftKeyPrefix = "resume-builder:local-draft:v1:";
 const fitTolerancePx = 2;
@@ -127,6 +129,8 @@ const state = {
   pendingPreviewVersion: null,
   savedResumeSignature: "",
   localDraftStorageFailed: false,
+  editHistoryPast: [],
+  editHistoryFuture: [],
   pendingDelete: null,
   dataDialogMode: "",
   dataDialogBusy: false,
@@ -166,6 +170,8 @@ const elements = {
   addResumeMenu: document.querySelector("#addResumeMenu"),
   manageResumeMenu: document.querySelector("#manageResumeMenu"),
   deleteResumeHint: document.querySelector("#deleteResumeHint"),
+  undo: document.querySelector("#undoButton"),
+  redo: document.querySelector("#redoButton"),
   dataManager: document.querySelector("#dataManagerButton"),
   dataManagerMenu: document.querySelector("#dataManagerMenu"),
   exportData: document.querySelector("#exportDataButton"),
@@ -195,6 +201,8 @@ const elements = {
 let draftPreviewTimer = null;
 let draftPreviewVersion = 0;
 let localDraftTimer = null;
+let editHistoryMergeTimer = null;
+let editHistoryMergeKey = "";
 let resolveDialog = null;
 let dialogConfig = null;
 let dialogReturnFocus = null;
@@ -223,6 +231,94 @@ function ensureLayout(resume) {
 
 function resumeSignature(resume) {
   return JSON.stringify(resume);
+}
+
+function createEditHistorySnapshot() {
+  const resume = structuredClone(state.resume);
+  return {
+    resume,
+    signature: resumeSignature(resume),
+    activeArea: state.activeArea,
+    activeModule: state.activeModule,
+    selectedPreviewSection: state.selectedPreviewSection,
+    selectedPreviewPath: state.selectedPreviewPath
+  };
+}
+
+function closeEditHistoryTransaction() {
+  clearTimeout(editHistoryMergeTimer);
+  editHistoryMergeTimer = null;
+  editHistoryMergeKey = "";
+}
+
+function resetEditHistory() {
+  closeEditHistoryTransaction();
+  state.editHistoryPast = [];
+  state.editHistoryFuture = [];
+}
+
+function pushBoundedEditHistory(stack, snapshot) {
+  stack.push(snapshot);
+  if (stack.length > editHistoryLimit) {
+    stack.splice(0, stack.length - editHistoryLimit);
+  }
+}
+
+function recordEditHistoryBeforeChange(mergeKey = "") {
+  if (!state.resume) {
+    return;
+  }
+
+  if (mergeKey && editHistoryMergeKey === mergeKey) {
+    clearTimeout(editHistoryMergeTimer);
+    editHistoryMergeTimer = setTimeout(closeEditHistoryTransaction, editHistoryMergeDelayMs);
+    return;
+  }
+
+  closeEditHistoryTransaction();
+  const snapshot = createEditHistorySnapshot();
+  const previous = state.editHistoryPast.at(-1);
+  if (!previous || previous.signature !== snapshot.signature) {
+    pushBoundedEditHistory(state.editHistoryPast, snapshot);
+  }
+  state.editHistoryFuture = [];
+
+  if (mergeKey) {
+    editHistoryMergeKey = mergeKey;
+    editHistoryMergeTimer = setTimeout(closeEditHistoryTransaction, editHistoryMergeDelayMs);
+  }
+}
+
+function applyEditHistorySnapshot(snapshot, actionLabel) {
+  state.resume = ensureLayout(structuredClone(snapshot.resume));
+  state.activeArea = snapshot.activeArea;
+  state.activeModule = snapshot.activeModule;
+  state.selectedPreviewSection = snapshot.selectedPreviewSection;
+  state.selectedPreviewPath = snapshot.selectedPreviewPath;
+  state.pendingDelete = null;
+  markDirty();
+  renderAll();
+  setMessage(`${actionLabel}${state.dirty ? "，内容尚未保存" : "，已回到保存版本"}`, state.dirty ? "warning" : "ok");
+}
+
+function undoEdit() {
+  if (isBusy() || state.editHistoryPast.length === 0 || !state.resume) {
+    return;
+  }
+  closeEditHistoryTransaction();
+  pushBoundedEditHistory(state.editHistoryFuture, createEditHistorySnapshot());
+  const snapshot = state.editHistoryPast.pop();
+  applyEditHistorySnapshot(snapshot, "已撤销");
+}
+
+function redoEdit() {
+  if (isBusy() || state.editHistoryFuture.length === 0 || !state.resume) {
+    return;
+  }
+  closeEditHistoryTransaction();
+  pushBoundedEditHistory(state.editHistoryPast, createEditHistorySnapshot());
+  const snapshot = state.editHistoryFuture.pop();
+  applyEditHistorySnapshot(snapshot, "已重做");
 }
 
 function localDraftKey(resumeId) {
@@ -367,12 +463,16 @@ function markDirty(changeKind = "content") {
   if (changeKind === "content") {
     state.contentRevision += 1;
   }
-  state.dirty = true;
-  state.saveState = "unsaved";
+  state.dirty = resumeSignature(state.resume) !== state.savedResumeSignature;
+  state.saveState = state.dirty ? "unsaved" : "saved";
   state.generation = "needs generate";
   state.effectiveLayout = null;
   state.layoutOverflow = null;
-  scheduleLocalDraftWrite();
+  if (state.dirty) {
+    scheduleLocalDraftWrite();
+  } else {
+    clearLocalDraft(state.activeResumeId);
+  }
   scheduleDraftPreview();
 }
 
@@ -1893,6 +1993,8 @@ function renderStatus() {
         : "生成 PDF";
   elements.loadExample.disabled = busy;
   elements.exampleSelect.disabled = busy;
+  elements.undo.disabled = !state.resume || state.editHistoryPast.length === 0 || busy;
+  elements.redo.disabled = !state.resume || state.editHistoryFuture.length === 0 || busy;
   renderResumeSelector();
 }
 
@@ -2217,11 +2319,18 @@ function setPath(path, value) {
   current[Number.isInteger(Number(finalPart)) ? Number(finalPart) : finalPart] = value;
 }
 
+function getPath(path) {
+  return path.split(".").reduce((current, part) => (
+    current?.[Number.isInteger(Number(part)) ? Number(part) : part]
+  ), state.resume);
+}
+
 function moveItem(array, index, direction) {
   const nextIndex = index + direction;
   if (nextIndex < 0 || nextIndex >= array.length) {
     return;
   }
+  recordEditHistoryBeforeChange();
   const [item] = array.splice(index, 1);
   array.splice(nextIndex, 0, item);
   state.pendingDelete = null;
@@ -2264,6 +2373,7 @@ function confirmDelete(pending) {
   }
 
   state.pendingDelete = null;
+  recordEditHistoryBeforeChange();
   if (pending.kind === "bullet") {
     state.resume[pending.key][pending.index].items.splice(pending.itemIndex, 1);
     markDirty();
@@ -2308,10 +2418,11 @@ function commitLayoutChange(focusSelector, { rerender = true } = {}) {
   }
 }
 
-function setLayoutSetting(field, value, focusSelector, options) {
+function setLayoutSetting(field, value, focusSelector, options = {}) {
   if (state.resume.layout[field] === value) {
     return false;
   }
+  recordEditHistoryBeforeChange(options.historyKey || "");
   state.resume.layout[field] = value;
   commitLayoutChange(focusSelector, options);
   return true;
@@ -2365,6 +2476,7 @@ function resetLayoutSettings() {
   if (!changed) {
     return;
   }
+  recordEditHistoryBeforeChange();
   Object.assign(state.resume.layout, defaultLayoutSettings);
   commitLayoutChange("[data-action='reset-layout']");
 }
@@ -2417,6 +2529,7 @@ function handleAction(button) {
   if (action === "add-experience") {
     state.pendingDelete = null;
     const nextIndex = state.resume[key].length;
+    recordEditHistoryBeforeChange();
     state.resume[key].push(newExperience(key));
     markDirty();
     renderForm();
@@ -2427,6 +2540,7 @@ function handleAction(button) {
   if (action === "add-skill") {
     state.pendingDelete = null;
     const nextIndex = state.resume.skills.length;
+    recordEditHistoryBeforeChange();
     state.resume.skills.push({ title: "", items: [""] });
     markDirty();
     renderForm();
@@ -2438,6 +2552,7 @@ function handleAction(button) {
     state.pendingDelete = null;
     state.resume[key][index].items ||= [];
     const nextItemIndex = state.resume[key][index].items.length;
+    recordEditHistoryBeforeChange();
     state.resume[key][index].items.push("");
     markDirty();
     renderForm();
@@ -2486,6 +2601,8 @@ async function saveResume() {
     return true;
   }
 
+  closeEditHistoryTransaction();
+
   const saved = await withBusy("saving", async () => {
     try {
       const body = await requestJson(activeResumeUrl("/api/resume"), {
@@ -2517,6 +2634,7 @@ function resetResumeEditorState() {
   cancelDraftPreview();
   clearTimeout(localDraftTimer);
   localDraftTimer = null;
+  resetEditHistory();
   state.activeArea = "content";
   state.activeModule = "profile";
   state.resume = null;
@@ -2843,6 +2961,7 @@ async function loadExample() {
       body: JSON.stringify({ resumeId: state.activeResumeId, id: elements.exampleSelect.value })
     });
     state.resume = ensureLayout(body.resume);
+    resetEditHistory();
     state.savedResumeSignature = resumeSignature(state.resume);
     state.dirty = false;
     state.saveState = "saved";
@@ -2881,6 +3000,7 @@ async function uploadPhoto(file) {
       body: JSON.stringify({ resumeId: state.activeResumeId, filename: file.name, dataUrl })
     });
     state.resume = ensureLayout(body.resume);
+    resetEditHistory();
     state.savedResumeSignature = resumeSignature(state.resume);
     state.dirty = false;
     state.saveState = "saved";
@@ -2916,6 +3036,7 @@ async function restoreBackup() {
       body: JSON.stringify({ resumeId: state.activeResumeId, file })
     });
     state.resume = ensureLayout(body.resume);
+    resetEditHistory();
     state.savedResumeSignature = resumeSignature(state.resume);
     state.dirty = false;
     state.saveState = "saved";
@@ -3150,7 +3271,7 @@ elements.form.addEventListener("input", (event) => {
       field,
       layoutControl.value,
       `input[data-layout-field="${field}"]`,
-      { rerender: false }
+      { rerender: false, historyKey: `layout:${field}` }
     );
     syncLayoutNumberControl(field, layoutControl);
     return;
@@ -3160,8 +3281,18 @@ elements.form.addEventListener("input", (event) => {
   if (!control || control.readOnly) {
     return;
   }
+  if (String(getPath(control.dataset.path) ?? "") === control.value) {
+    return;
+  }
+  recordEditHistoryBeforeChange(`field:${control.dataset.path}`);
   setPath(control.dataset.path, control.value);
   markDirty();
+});
+
+elements.form.addEventListener("focusout", (event) => {
+  if (event.target.closest("[data-path], input[data-layout-field]")) {
+    closeEditHistoryTransaction();
+  }
 });
 
 elements.form.addEventListener("click", (event) => {
@@ -3185,11 +3316,31 @@ elements.openPdf.addEventListener("click", () => {
 });
 elements.loadExample.addEventListener("click", loadExample);
 elements.restoreBackup.addEventListener("click", restoreBackup);
+elements.undo.addEventListener("click", undoEdit);
+elements.redo.addEventListener("click", redoEdit);
 document.addEventListener("keydown", (event) => {
+  const key = event.key.toLowerCase();
+  const modifier = event.metaKey || event.ctrlKey;
+  const dialogOpen = elements.dialog.open || elements.dataDialog.open;
+  const isUndoShortcut = modifier && !event.altKey && !event.shiftKey && key === "z";
+  const isRedoShortcut = !event.altKey && (
+    (modifier && event.shiftKey && key === "z")
+    || (event.ctrlKey && !event.metaKey && !event.shiftKey && key === "y")
+  );
+  if (!dialogOpen && (isUndoShortcut || isRedoShortcut)) {
+    event.preventDefault();
+    if (isRedoShortcut) {
+      redoEdit();
+    } else {
+      undoEdit();
+    }
+    return;
+  }
+
   const isSaveShortcut = (event.metaKey || event.ctrlKey)
     && !event.altKey
     && !event.shiftKey
-    && event.key.toLowerCase() === "s";
+    && key === "s";
   if (!isSaveShortcut) {
     return;
   }

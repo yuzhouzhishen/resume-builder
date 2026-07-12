@@ -31,6 +31,10 @@
               <p class="toolbar-menu-hint" id="deleteResumeHint" hidden>至少需要保留一份简历</p>
             </div>
           </div>
+          <div class="edit-history-controls" role="group" aria-label="编辑历史">
+            <button class="toolbar-icon-button edit-history-button" type="button" id="undoButton" aria-label="撤销" title="撤销（Cmd/Ctrl + Z）" disabled><span aria-hidden="true">↶</span></button>
+            <button class="toolbar-icon-button edit-history-button" type="button" id="redoButton" aria-label="重做" title="重做（Cmd/Ctrl + Shift + Z）" disabled><span aria-hidden="true">↷</span></button>
+          </div>
           <div class="data-manager">
             <button class="ghost-button toolbar-command-button" type="button" id="dataManagerButton" aria-haspopup="menu" aria-expanded="false" aria-controls="dataManagerMenu">数据管理</button>
             <div class="toolbar-menu toolbar-menu-data" id="dataManagerMenu" role="menu" hidden>
