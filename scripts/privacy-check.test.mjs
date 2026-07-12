@@ -319,8 +319,10 @@ test("package scripts run privacy checks locally and in CI", () => {
   );
 
   assert.equal(packageJson.scripts["privacy:check"], "node scripts/privacy-check.mjs");
+  assert.equal(packageJson.scripts["editor:open"], "node scripts/launch-editor.mjs");
   assert.equal(packageJson.scripts.ci, "npm test");
   assert.match(packageJson.scripts.test, /^npm run privacy:check && /);
+  assert.match(packageJson.scripts.test, /scripts\/launch-editor\.test\.mjs/);
   assert.match(packageJson.scripts.test, /scripts\/ci-workflow\.test\.mjs/);
   assert.match(packageJson.scripts.test, /scripts\/privacy-check\.test\.mjs/);
   assert.match(packageJson.scripts.test, /--test-timeout=60000/);

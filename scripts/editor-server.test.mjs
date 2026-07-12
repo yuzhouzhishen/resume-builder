@@ -10,7 +10,7 @@ import { unzipSync } from "fflate";
 import { chromium } from "playwright";
 
 import { createDataPackage } from "./data-package.mjs";
-import { createEditorServer, startEditorServer } from "./editor-server.mjs";
+import { createEditorInstanceId, createEditorServer, startEditorServer } from "./editor-server.mjs";
 import { renderResumeHtml } from "./generate.mjs";
 import { loadResumeYaml, saveResumeYaml } from "./resume-data.mjs";
 
@@ -500,6 +500,35 @@ test("editor server serves the local editor shell", async (t) => {
   assert.match(html, /id="previewFrame"/);
   assert.match(html, /A4 待测量/);
   assert.doesNotMatch(html, /id="previewImage"/);
+});
+
+test("GET /api/health exposes only an opaque local instance identity", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+
+  const response = await fetch(`${app.url}/api/health`);
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(Object.keys(body).sort(), ["app", "instanceId", "ok", "protocolVersion"]);
+  assert.equal(body.ok, true);
+  assert.equal(body.app, "resume-builder");
+  assert.equal(body.protocolVersion, 1);
+  assert.match(body.instanceId, /^[a-f0-9]{24}$/);
+  assert.equal(app.instanceId, body.instanceId);
+  assert.equal(JSON.stringify(body).includes(rootDir), false);
+
+  const rejected = await fetch(`${app.url}/api/health`, { method: "POST" });
+  assert.equal(rejected.status, 405);
+});
+
+test("editor instance identity canonicalizes equivalent data-root paths", () => {
+  const rootDir = makeApiFixture();
+  const aliases = mkdtempSync(path.join(tmpdir(), "resume-health-alias-"));
+  const alias = path.join(aliases, "data-link");
+  symlinkSync(rootDir, alias);
+
+  assert.equal(createEditorInstanceId(alias), createEditorInstanceId(rootDir));
 });
 
 test("editor server close terminates a request already being handled", async () => {

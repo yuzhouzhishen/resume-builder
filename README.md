@@ -6,8 +6,24 @@
 
 ## 快速开始
 
+先安装 Node.js `20.12` 或更高版本。Node 是 macOS 和 Windows 都需要手动预装的唯一启动前提。
+
+日常使用可以直接双击项目根目录中的启动文件：
+
+- macOS：`Start Resume Builder.command`
+- Windows：`Start Resume Builder.cmd`
+
+启动器会自动定位项目目录。缺少 npm 依赖时执行 `npm install`，缺少 Playwright Chromium 时执行 `npx playwright install chromium`；随后复用已经运行的同一数据目录实例，或启动新服务并打开默认浏览器。运行期间保留终端窗口，按 `Ctrl+C` 或关闭窗口即可停止服务。
+
+也可以从终端启动并自动打开浏览器：
+
 ```bash
-cd ~/Downloads/resume-builder
+npm run editor:open
+```
+
+先在终端进入项目目录。原有手动方式也保持可用：
+
+```bash
 npm install
 npm run editor
 ```
@@ -45,6 +61,8 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 ## 当前文档
 
+- [V2.7 跨平台启动器设计](docs/plans/2026-07-12-v2-7-cross-platform-launcher-design.md)
+- [V2.7 跨平台启动器实施计划](docs/plans/2026-07-12-v2-7-cross-platform-launcher.md)
 - [V2.6 编辑历史设计](docs/plans/2026-07-12-v2-6-edit-history-design.md)
 - [V2.6 编辑历史实施计划](docs/plans/2026-07-12-v2-6-edit-history.md)
 - [V2.5 本机草稿恢复设计](docs/plans/2026-07-12-v2-5-local-draft-recovery-design.md)
@@ -78,6 +96,8 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 ## 首次安装
 
+安装 Node.js `20.12+` 后，可以直接双击对应系统的启动文件，npm 依赖和 Chromium 会在缺失时自动安装。也可以手动执行：
+
 ```bash
 npm install
 ```
@@ -90,9 +110,13 @@ npx playwright install chromium
 
 如果提示 Poppler 缺失：
 
+macOS：
+
 ```bash
 brew install poppler
 ```
+
+Windows 需要安装包含 `pdfinfo.exe` 和 `pdftoppm.exe` 的 Poppler，并把其 `bin` 目录加入 `PATH`。启动器不会擅自调用系统包管理器；Poppler 缺失时仍可编辑和保存内容，但正式 PDF/PNG 生成会提示安装依赖。
 
 ## 数据目录
 
@@ -385,6 +409,12 @@ YAML 对英文冒号加空格比较敏感，例如：
 ### 端口打不开怎么办？
 
 确认 `npm run editor` 还在运行。`npm run generate` 只生成文件，不会启动网站。如果浏览器显示 `ERR_CONNECTION_REFUSED`，通常是本地编辑器服务没有启动或已经退出。
+
+双击启动器或运行 `npm run editor:open` 会扫描 `4321-4330`：发现使用同一数据目录的 Resume Builder 时直接重新打开，不会重复启动；端口被其他程序占用时仍按原逻辑自动选择下一个端口。
+
+### 双击启动文件后立即关闭怎么办？
+
+先确认已安装 Node.js `20.12+`，并重新双击。启动失败时 macOS 和 Windows 启动文件会保留错误信息；常见原因是 Node 未加入 `PATH`、首次安装依赖时网络不可用，或者 `4321-4330` 全部被占用。
 
 ### 提示前端和后端版本不一致怎么办？
 

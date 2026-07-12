@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +11,7 @@ import { createDataImportManager, createDataPackage } from "./data-package.mjs";
 import { createDataRecoveryManager } from "./data-recovery.mjs";
 import { ensureDataRoot } from "./data-root.mjs";
 import { buildLayoutCandidates, publicLayoutCandidate } from "./layout-settings.mjs";
-import { resolvePathInside } from "./path-safety.mjs";
+import { canonicalizePath, resolvePathInside } from "./path-safety.mjs";
 import {
   loadResumeYaml,
   resolveResumeLayout,
@@ -36,6 +37,7 @@ const DEFAULT_MAX_PORT = 4330;
 const DEFAULT_BODY_LIMIT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_PHOTO_LIMIT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_DATA_ARCHIVE_LIMIT_BYTES = 50 * 1024 * 1024;
+const HEALTH_PROTOCOL_VERSION = 1;
 const BACKUP_DIR = "backups";
 const BACKUP_FILE_PATTERN = /^resume-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})(?:-\d+)?\.yaml$/;
 const SNAPSHOT_ID_PATTERN = /^[a-f0-9]{64}$/;
@@ -73,6 +75,13 @@ const PHOTO_TYPES = {
   ".webp": "image/webp",
   ".svg": "image/svg+xml"
 };
+
+export function createEditorInstanceId(dataRoot) {
+  return createHash("sha256")
+    .update(canonicalizePath(dataRoot))
+    .digest("hex")
+    .slice(0, 24);
+}
 
 function sendText(response, statusCode, body, contentType = "text/plain; charset=utf-8") {
   response.writeHead(statusCode, {
@@ -1028,9 +1037,24 @@ export function createEditorServer(options = {}) {
       || dataRecoveryManager.isRestoring()
   });
   const appVersion = options.appVersion || "0.1.0";
+  const instanceId = options.instanceId || createEditorInstanceId(dataRoot);
 
   const server = http.createServer(async (request, response) => {
     const url = new URL(request.url || "/", `http://${request.headers.host || DEFAULT_HOST}`);
+
+    if (url.pathname === "/api/health") {
+      if (request.method !== "GET") {
+        sendJson(response, 405, { ok: false, error: "Method not allowed." });
+        return;
+      }
+      sendJson(response, 200, {
+        ok: true,
+        app: "resume-builder",
+        protocolVersion: HEALTH_PROTOCOL_VERSION,
+        instanceId
+      });
+      return;
+    }
 
     if (request.method === "GET" && url.pathname === "/") {
       sendFile(response, path.join(projectRoot, "editor", "index.html"));
@@ -1272,6 +1296,7 @@ export async function startEditorServer(options = {}) {
   const log = options.log === false ? null : options.log || console.log;
   const dataRoot = path.resolve(options.dataRoot || options.rootDir || PROJECT_ROOT);
   const dataArchiveLimitBytes = options.dataArchiveLimitBytes ?? DEFAULT_DATA_ARCHIVE_LIMIT_BYTES;
+  const instanceId = options.instanceId || createEditorInstanceId(dataRoot);
   const { dataImportManager, dataRecoveryManager } = createEditorDataManagers(
     options,
     dataRoot,
@@ -1283,6 +1308,7 @@ export async function startEditorServer(options = {}) {
   );
   const serverOptions = {
     ...options,
+    instanceId,
     dataImportManager,
     dataRecoveryManager,
     disposeDataManagersOnClose: false
@@ -1312,6 +1338,7 @@ export async function startEditorServer(options = {}) {
           host,
           port,
           url,
+          instanceId,
           close: () => new Promise((resolve, reject) => {
             server.close((error) => {
               if (error) {
