@@ -61,6 +61,9 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 ## 当前文档
 
+- [V2.7 当前边界](docs/v2-7-boundaries.md)
+- [V2.7 验收清单](docs/v2-7-acceptance-checklist.md)
+- [V2.7 发布收尾计划](docs/plans/2026-07-12-v2-7-release-closure.md)
 - [V2.7 跨平台启动器设计](docs/plans/2026-07-12-v2-7-cross-platform-launcher-design.md)
 - [V2.7 跨平台启动器实施计划](docs/plans/2026-07-12-v2-7-cross-platform-launcher.md)
 - [V2.6 编辑历史设计](docs/plans/2026-07-12-v2-6-edit-history-design.md)
