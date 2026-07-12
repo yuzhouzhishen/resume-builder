@@ -827,6 +827,10 @@ test("editor opens a profile field when the matching preview field is selected",
   assert.equal(await page.getAttribute("[data-area='content']", "aria-selected"), "true");
   assert.equal(await page.getAttribute("[data-module='profile']", "aria-selected"), "true");
   assert.equal(await page.locator("[data-path='profile.name']").inputValue(), "测试候选人");
+  assert.equal(
+    await page.locator("[data-path='profile.name']").evaluate((input) => input.selectionStart),
+    "测试候选人".length
+  );
   assert.match(await page.textContent("#messageLine"), /正在编辑：姓名/);
 });
 
@@ -905,6 +909,10 @@ test("editor opens nested form controls when matching preview fields are clicked
   await page.waitForFunction(() => document.querySelector("[data-module='skills']")?.getAttribute("aria-selected") === "true");
   assert.equal(await page.getAttribute("[data-module='skills']", "aria-selected"), "true");
   assert.equal(await page.locator("[data-path='skills.0.items.0']").inputValue(), "熟悉 C/C++ 基本语法。");
+  assert.equal(
+    await page.locator("[data-path='skills.0.items.0']").evaluate((textarea) => textarea.selectionStart),
+    "熟悉 C/C++ 基本语法。".length
+  );
   assert.match(await page.textContent("#messageLine"), /正在编辑：专业技能 1 要点 1/);
 
   await sendPreviewSelection(page, "projects", "projects.0.items.0");

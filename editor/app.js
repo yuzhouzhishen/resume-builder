@@ -957,12 +957,25 @@ function focusFormPath(path) {
   target.scrollIntoView({ block: "center", behavior: "smooth" });
 
   if (target.matches("input, textarea, select, button")) {
-    target.focus({ preventScroll: true });
+    focusPreviewTargetControl(target);
     return true;
   }
 
-  target.querySelector("input, textarea, select")?.focus({ preventScroll: true });
+  const control = target.querySelector("input, textarea, select");
+  if (control) {
+    focusPreviewTargetControl(control);
+  }
   return true;
+}
+
+function focusPreviewTargetControl(control) {
+  control.focus({ preventScroll: true });
+  if (typeof control.selectionStart !== "number") {
+    return;
+  }
+
+  const end = control.value.length;
+  control.setSelectionRange(end, end);
 }
 
 function moduleForPreviewTarget(section, path) {
