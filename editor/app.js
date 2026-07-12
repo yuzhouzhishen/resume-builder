@@ -69,6 +69,9 @@ const layoutNumberFields = Object.freeze({
   spacingLevel: Object.freeze({ label: "内容间距", min: 0, max: 100, step: 1, unit: "", precision: 0 })
 });
 const draftPreviewDelayMs = 300;
+const localDraftWriteDelayMs = 150;
+const localDraftVersion = 1;
+const localDraftKeyPrefix = "resume-builder:local-draft:v1:";
 const fitTolerancePx = 2;
 const allowedLayoutCssVariables = new Set([
   "--page-x",
@@ -122,6 +125,8 @@ const state = {
   renderedContentRevision: null,
   pendingPreviewContentRevision: null,
   pendingPreviewVersion: null,
+  savedResumeSignature: "",
+  localDraftStorageFailed: false,
   pendingDelete: null,
   dataDialogMode: "",
   dataDialogBusy: false,
@@ -189,6 +194,7 @@ const elements = {
 
 let draftPreviewTimer = null;
 let draftPreviewVersion = 0;
+let localDraftTimer = null;
 let resolveDialog = null;
 let dialogConfig = null;
 let dialogReturnFocus = null;
@@ -213,6 +219,113 @@ function ensureLayout(resume) {
     resume.layout[key] ??= value;
   }
   return resume;
+}
+
+function resumeSignature(resume) {
+  return JSON.stringify(resume);
+}
+
+function localDraftKey(resumeId) {
+  return `${localDraftKeyPrefix}${resumeId}`;
+}
+
+function isUsableLocalDraftResume(resume) {
+  return Boolean(resume)
+    && typeof resume === "object"
+    && !Array.isArray(resume)
+    && resume.profile
+    && typeof resume.profile === "object"
+    && Array.isArray(resume.skills)
+    && Array.isArray(resume.internships)
+    && Array.isArray(resume.projects);
+}
+
+function clearLocalDraft(resumeId) {
+  if (!resumeId) {
+    return;
+  }
+  if (resumeId === state.activeResumeId) {
+    clearTimeout(localDraftTimer);
+    localDraftTimer = null;
+  }
+  try {
+    localStorage.removeItem(localDraftKey(resumeId));
+  } catch (_error) {
+    // Editing must remain available when browser storage is unavailable.
+  }
+}
+
+function clearAllLocalDrafts() {
+  clearTimeout(localDraftTimer);
+  localDraftTimer = null;
+  try {
+    const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));
+    for (const key of keys) {
+      if (key?.startsWith(localDraftKeyPrefix)) {
+        localStorage.removeItem(key);
+      }
+    }
+  } catch (_error) {
+    // Whole-data replacement still succeeds if browser storage is unavailable.
+  }
+}
+
+function readLocalDraft(resumeId) {
+  if (!resumeId) {
+    return null;
+  }
+  let record;
+  try {
+    const raw = localStorage.getItem(localDraftKey(resumeId));
+    if (!raw) {
+      return null;
+    }
+    record = JSON.parse(raw);
+  } catch (_error) {
+    clearLocalDraft(resumeId);
+    return null;
+  }
+
+  const valid = record?.version === localDraftVersion
+    && record.resumeId === resumeId
+    && typeof record.baseSignature === "string"
+    && typeof record.updatedAt === "string"
+    && !Number.isNaN(new Date(record.updatedAt).getTime())
+    && isUsableLocalDraftResume(record.resume);
+  if (!valid) {
+    clearLocalDraft(resumeId);
+    return null;
+  }
+  return record;
+}
+
+function flushLocalDraft() {
+  clearTimeout(localDraftTimer);
+  localDraftTimer = null;
+  if (!state.dirty || !state.activeResumeId || !state.resume) {
+    return;
+  }
+
+  try {
+    localStorage.setItem(localDraftKey(state.activeResumeId), JSON.stringify({
+      version: localDraftVersion,
+      resumeId: state.activeResumeId,
+      baseSignature: state.savedResumeSignature,
+      updatedAt: new Date().toISOString(),
+      resume: state.resume
+    }));
+    state.localDraftStorageFailed = false;
+  } catch (_error) {
+    if (!state.localDraftStorageFailed) {
+      state.localDraftStorageFailed = true;
+      setMessage("无法保存本机恢复草稿，请及时保存当前简历。", "warning");
+    }
+  }
+}
+
+function scheduleLocalDraftWrite() {
+  clearTimeout(localDraftTimer);
+  localDraftTimer = setTimeout(flushLocalDraft, localDraftWriteDelayMs);
 }
 
 function activeResumeEntry() {
@@ -259,7 +372,71 @@ function markDirty(changeKind = "content") {
   state.generation = "needs generate";
   state.effectiveLayout = null;
   state.layoutOverflow = null;
+  scheduleLocalDraftWrite();
   scheduleDraftPreview();
+}
+
+function localDraftUpdatedLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "时间未知";
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).format(date);
+}
+
+async function offerLocalDraftRecovery() {
+  const resumeId = state.activeResumeId;
+  const record = readLocalDraft(resumeId);
+  if (!record || !state.resume) {
+    return "none";
+  }
+
+  const baseChanged = record.baseSignature !== state.savedResumeSignature;
+  const description = baseChanged
+    ? `发现 ${localDraftUpdatedLabel(record.updatedAt)} 留下的未保存草稿，但正式内容已发生变化。恢复后请核对再保存。`
+    : `发现 ${localDraftUpdatedLabel(record.updatedAt)} 留下的未保存草稿。恢复不会立即写入 YAML。`;
+  const result = await showResumeDialog({
+    title: "发现未保存草稿",
+    description,
+    actions: [
+      { id: "keep-local-draft", label: "暂不处理" },
+      { id: "discard-local-draft", label: "放弃草稿", kind: "danger" },
+      { id: "restore-local-draft", label: "恢复草稿", kind: "primary" }
+    ]
+  });
+
+  if (state.activeResumeId !== resumeId) {
+    return "stale";
+  }
+  if (result.action === "discard-local-draft") {
+    clearLocalDraft(resumeId);
+    setMessage("已放弃未保存草稿", "ok");
+    return "discarded";
+  }
+  if (result.action !== "restore-local-draft") {
+    return "kept";
+  }
+
+  state.resume = ensureLayout(structuredClone(record.resume));
+  state.pendingDelete = null;
+  state.activeArea = "content";
+  state.activeModule = "profile";
+  state.selectedPreviewSection = "";
+  state.selectedPreviewPath = "";
+  markDirty();
+  renderAll();
+  setMessage(baseChanged
+    ? "已恢复本机草稿；正式内容曾发生变化，请核对后保存"
+    : "已恢复本机草稿，内容尚未保存", "warning");
+  return "restored";
 }
 
 function cancelDraftPreview() {
@@ -1388,6 +1565,7 @@ async function commitDataImport() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ token: state.pendingImport.token })
     });
+    clearAllLocalDrafts();
     applyRegistry(body);
     state.pendingImport = null;
     state.dataDialogBusy = false;
@@ -1490,6 +1668,7 @@ async function commitDataRecovery() {
     return;
   }
 
+  clearAllLocalDrafts();
   applyRegistry(body);
   const recoveryMessage = `恢复完成，当前数据已保留到 ${safeBackupName(body.preRestoreBackup)}`;
   state.pendingRecoveryRefresh = { message: recoveryMessage };
@@ -1531,6 +1710,7 @@ async function loadResumes() {
 async function loadResume() {
   const body = await requestJson(activeResumeUrl("/api/resume"));
   state.resume = ensureLayout(body.resume);
+  state.savedResumeSignature = resumeSignature(state.resume);
   state.dirty = false;
   state.saveState = "saved";
   state.generation = body.generatedPreviewAvailable === false ? "needs generate" : "loaded";
@@ -2314,9 +2494,11 @@ async function saveResume() {
         body: JSON.stringify(state.resume)
       });
       state.resume = ensureLayout(body.resume);
+      state.savedResumeSignature = resumeSignature(state.resume);
       state.dirty = false;
       state.saveState = "saved";
       state.generation = "needs generate";
+      clearLocalDraft(state.activeResumeId);
       await loadBackups();
       setMessage(backupMessage("已保存，待生成", body.backup), "ok");
       renderAll();
@@ -2333,9 +2515,13 @@ async function saveResume() {
 
 function resetResumeEditorState() {
   cancelDraftPreview();
+  clearTimeout(localDraftTimer);
+  localDraftTimer = null;
   state.activeArea = "content";
   state.activeModule = "profile";
   state.resume = null;
+  state.savedResumeSignature = "";
+  state.localDraftStorageFailed = false;
   state.backups = [];
   state.dirty = false;
   state.saveState = "loading";
@@ -2364,6 +2550,7 @@ async function loadSelectedResume({ draftOnly = false } = {}) {
   }
   showLoadedPreview({ draftOnly });
   renderAll();
+  return offerLocalDraftRecovery();
 }
 
 async function performResumeSwitch(targetId) {
@@ -2378,8 +2565,10 @@ async function performResumeSwitch(targetId) {
         method: "POST"
       });
       applyRegistry(body);
-      await loadSelectedResume();
-      setMessage(`已切换到 ${activeResumeEntry()?.name || targetId}`, "ok");
+      const recoveryAction = await loadSelectedResume();
+      if (recoveryAction !== "restored") {
+        setMessage(`已切换到 ${activeResumeEntry()?.name || targetId}`, "ok");
+      }
       return true;
     } catch (error) {
       setMessage(`切换失败：${error.message}`, "error");
@@ -2425,6 +2614,7 @@ async function requestResumeSwitch(targetId) {
   }
 
   if (result.action === "discard-switch") {
+    clearLocalDraft(state.activeResumeId);
     await performResumeSwitch(targetId);
     return;
   }
@@ -2432,7 +2622,10 @@ async function requestResumeSwitch(targetId) {
   renderResumeSelector();
 }
 
-async function applyCreatedResume(body) {
+async function applyCreatedResume(body, { discardedResumeId = "" } = {}) {
+  if (discardedResumeId) {
+    clearLocalDraft(discardedResumeId);
+  }
   applyRegistry(body);
   await loadSelectedResume({ draftOnly: true });
   setMessage(`已新建 ${activeResumeEntry()?.name || "简历"}，PDF 待生成`, "ok");
@@ -2440,7 +2633,7 @@ async function applyCreatedResume(body) {
 
 async function prepareForCreatedResumeSwitch() {
   if (!state.dirty) {
-    return true;
+    return "clean";
   }
 
   const result = await showResumeDialog({
@@ -2454,14 +2647,19 @@ async function prepareForCreatedResumeSwitch() {
   });
 
   if (result.action === "save-create") {
-    return saveResume();
+    return await saveResume() ? "saved" : "";
   }
 
-  return result.action === "discard-create";
+  if (result.action === "discard-create") {
+    return "discard";
+  }
+
+  return "";
 }
 
 async function duplicateCurrentResume() {
-  if (!await prepareForCreatedResumeSwitch()) {
+  const switchDisposition = await prepareForCreatedResumeSwitch();
+  if (!switchDisposition) {
     return;
   }
 
@@ -2487,7 +2685,9 @@ async function duplicateCurrentResume() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ sourceId: state.activeResumeId, name: result.name })
       });
-      await applyCreatedResume(body);
+      await applyCreatedResume(body, {
+        discardedResumeId: switchDisposition === "discard" ? state.activeResumeId : ""
+      });
     } catch (error) {
       setMessage(`复制失败：${error.message}`, "error");
     }
@@ -2495,7 +2695,8 @@ async function duplicateCurrentResume() {
 }
 
 async function createResumeFromExample() {
-  if (!await prepareForCreatedResumeSwitch()) {
+  const switchDisposition = await prepareForCreatedResumeSwitch();
+  if (!switchDisposition) {
     return;
   }
 
@@ -2522,7 +2723,9 @@ async function createResumeFromExample() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ exampleId: result.exampleId, name: result.name })
       });
-      await applyCreatedResume(body);
+      await applyCreatedResume(body, {
+        discardedResumeId: switchDisposition === "discard" ? state.activeResumeId : ""
+      });
     } catch (error) {
       setMessage(`新建失败：${error.message}`, "error");
     }
@@ -2583,12 +2786,16 @@ async function deleteCurrentResume() {
 
   await withBusy("deleting-resume", async () => {
     try {
-      const body = await requestJson(`/api/resumes/${encodeURIComponent(state.activeResumeId)}`, {
+      const deletedResumeId = state.activeResumeId;
+      const body = await requestJson(`/api/resumes/${encodeURIComponent(deletedResumeId)}`, {
         method: "DELETE"
       });
+      clearLocalDraft(deletedResumeId);
       applyRegistry(body);
-      await loadSelectedResume();
-      setMessage("简历已删除", "ok");
+      const recoveryAction = await loadSelectedResume();
+      if (recoveryAction !== "restored") {
+        setMessage("简历已删除", "ok");
+      }
     } catch (error) {
       setMessage(`删除失败：${error.message}`, "error");
     }
@@ -2636,9 +2843,11 @@ async function loadExample() {
       body: JSON.stringify({ resumeId: state.activeResumeId, id: elements.exampleSelect.value })
     });
     state.resume = ensureLayout(body.resume);
+    state.savedResumeSignature = resumeSignature(state.resume);
     state.dirty = false;
     state.saveState = "saved";
     state.generation = "needs generate";
+    clearLocalDraft(state.activeResumeId);
     await loadBackups();
     setMessage(backupMessage("已载入样例，待生成", body.backup), "ok");
     renderAll();
@@ -2672,9 +2881,11 @@ async function uploadPhoto(file) {
       body: JSON.stringify({ resumeId: state.activeResumeId, filename: file.name, dataUrl })
     });
     state.resume = ensureLayout(body.resume);
+    state.savedResumeSignature = resumeSignature(state.resume);
     state.dirty = false;
     state.saveState = "saved";
     state.generation = "needs generate";
+    clearLocalDraft(state.activeResumeId);
     await loadBackups();
     setMessage(backupMessage("已替换照片，待生成", body.backup), "ok");
     renderAll();
@@ -2705,9 +2916,11 @@ async function restoreBackup() {
       body: JSON.stringify({ resumeId: state.activeResumeId, file })
     });
     state.resume = ensureLayout(body.resume);
+    state.savedResumeSignature = resumeSignature(state.resume);
     state.dirty = false;
     state.saveState = "saved";
     state.generation = "needs generate";
+    clearLocalDraft(state.activeResumeId);
     state.pendingDelete = null;
     state.activeArea = "content";
     state.activeModule = "profile";
@@ -2985,6 +3198,7 @@ document.addEventListener("keydown", (event) => {
   void saveResume();
 });
 window.addEventListener("beforeunload", (event) => {
+  flushLocalDraft();
   if (!state.dirty) {
     return;
   }
@@ -2992,6 +3206,7 @@ window.addEventListener("beforeunload", (event) => {
   event.preventDefault();
   event.returnValue = "";
 });
+window.addEventListener("pagehide", flushLocalDraft);
 elements.preview.addEventListener("load", async () => {
   fitPreviewFrame();
   markPreviewSelection();
@@ -3032,6 +3247,7 @@ async function initialize() {
   await Promise.all([loadExamples(), loadResumes()]);
   await Promise.all([loadResume(), loadBackups()]);
   showLoadedPreview();
+  await offerLocalDraftRecovery();
 }
 
 initialize().catch((error) => {

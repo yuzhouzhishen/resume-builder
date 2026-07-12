@@ -1156,6 +1156,93 @@ test("editor renders unsaved edits in a debounced draft preview without writing 
   assert.equal(readFileSync(previewPath, "utf8"), generatedPreview);
 });
 
+test("editor stores and restores an unsaved browser-local draft without writing yaml", async (t) => {
+  const rootDir = makeApiFixture();
+  const resumePath = resumeYamlPath(rootDir);
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const draftKey = "resume-builder:local-draft:v1:cpp";
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "浏览器恢复草稿");
+  await page.waitForFunction((key) => {
+    const record = JSON.parse(localStorage.getItem(key) || "null");
+    return record?.resume?.profile?.name === "浏览器恢复草稿";
+  }, draftKey);
+
+  const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)), draftKey);
+  assert.equal(stored.version, 1);
+  assert.equal(stored.resumeId, "cpp");
+  assert.equal(typeof stored.baseSignature, "string");
+  assert.equal(typeof stored.updatedAt, "string");
+  assert.equal(loadResumeYaml(resumePath).profile.name, validResume.profile.name);
+
+  const recoveredPage = await page.context().newPage();
+  await recoveredPage.goto(app.url);
+  await recoveredPage.waitForFunction(() => document.querySelector("#resumeDialogTitle")?.textContent === "发现未保存草稿");
+  await recoveredPage.click("[data-dialog-action='restore-local-draft']");
+  await recoveredPage.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "浏览器恢复草稿");
+  await recoveredPage.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("未保存"));
+  await recoveredPage.waitForFunction(() => document
+    .querySelector("#previewFrame")
+    ?.contentDocument
+    ?.querySelector("[data-path='profile.name']")
+    ?.textContent
+    ?.includes("浏览器恢复草稿"));
+  assert.equal(loadResumeYaml(resumePath).profile.name, validResume.profile.name);
+
+  await recoveredPage.click("#saveButton");
+  await recoveredPage.waitForFunction(() => document.querySelector("#statusStrip")?.textContent?.includes("已保存"));
+  assert.equal(await recoveredPage.evaluate((key) => localStorage.getItem(key), draftKey), null);
+  assert.equal(loadResumeYaml(resumePath).profile.name, "浏览器恢复草稿");
+});
+
+test("editor warns about a changed yaml base and can discard its local draft", async (t) => {
+  const rootDir = makeApiFixture();
+  const resumePath = resumeYamlPath(rootDir);
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const draftKey = "resume-builder:local-draft:v1:cpp";
+
+  await page.goto(app.url);
+  await page.waitForSelector("[data-path='profile.name']");
+  await page.fill("[data-path='profile.name']", "旧的浏览器草稿");
+  await page.waitForFunction((key) => Boolean(localStorage.getItem(key)), draftKey);
+
+  const changedResume = structuredClone(validResume);
+  changedResume.profile.name = "磁盘中的新版本";
+  saveResumeYaml(resumePath, changedResume);
+
+  const reopenedPage = await page.context().newPage();
+  await reopenedPage.goto(app.url);
+  await reopenedPage.waitForFunction(() => document.querySelector("#resumeDialogTitle")?.textContent === "发现未保存草稿");
+  assert.match(await reopenedPage.textContent("#resumeDialogDescription"), /正式内容已发生变化/);
+  await reopenedPage.click("[data-dialog-action='discard-local-draft']");
+  await reopenedPage.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "磁盘中的新版本");
+  assert.equal(await reopenedPage.evaluate((key) => localStorage.getItem(key), draftKey), null);
+});
+
+test("editor removes a corrupt browser-local draft without blocking initialization", async (t) => {
+  const rootDir = makeApiFixture();
+  const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
+  t.after(async () => app.close());
+  const page = await openEditorPage(t);
+  const draftKey = "resume-builder:local-draft:v1:cpp";
+
+  await page.goto(app.url);
+  await page.evaluate((key) => localStorage.setItem(key, "{broken"), draftKey);
+  const reopenedPage = await page.context().newPage();
+  await reopenedPage.goto(app.url);
+  await reopenedPage.waitForSelector("[data-path='profile.name']");
+
+  assert.equal(await reopenedPage.inputValue("[data-path='profile.name']"), validResume.profile.name);
+  assert.equal(await reopenedPage.locator("#resumeDialog").getAttribute("open"), null);
+  assert.equal(await reopenedPage.evaluate((key) => localStorage.getItem(key), draftKey), null);
+});
+
 test("draft preview applies layout candidates in order and selects the first A4 fit", async (t) => {
   const rootDir = makeApiFixture();
   const app = await startEditorServer({ preferredPort: 0, maxPort: 0, rootDir, log: false });
@@ -3058,6 +3145,8 @@ test("dirty resume switching supports cancel and discard", async (t) => {
   await page.goto(app.url);
   await page.waitForSelector("[data-path='profile.name']");
   await page.fill("[data-path='profile.name']", "Unsaved Candidate");
+  const draftKey = "resume-builder:local-draft:v1:cpp";
+  await page.waitForFunction((key) => Boolean(localStorage.getItem(key)), draftKey);
   await selectResumeOption(page, "ai-agent");
   await page.waitForSelector("#resumeDialog[open]");
   assert.match(await page.textContent("#resumeDialogTitle"), /未保存/);
@@ -3065,11 +3154,13 @@ test("dirty resume switching supports cancel and discard", async (t) => {
   await page.click("[data-dialog-action='cancel']");
   assert.equal(await selectedResumeId(page), "cpp");
   assert.equal(await page.inputValue("[data-path='profile.name']"), "Unsaved Candidate");
+  assert.notEqual(await page.evaluate((key) => localStorage.getItem(key), draftKey), null);
 
   await selectResumeOption(page, "ai-agent");
   await page.click("[data-dialog-action='discard-switch']");
   await page.waitForFunction(() => document.querySelector("[data-path='profile.name']")?.value === "AI Candidate");
   assert.equal(await selectedResumeId(page), "ai-agent");
+  assert.equal(await page.evaluate((key) => localStorage.getItem(key), draftKey), null);
 });
 
 test("editor duplicates renames and deletes resume variants from toolbar menus", async (t) => {
