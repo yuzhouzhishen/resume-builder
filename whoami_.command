@@ -18,14 +18,7 @@ if [[ -x /usr/bin/osascript ]]; then
     "$project_dir/editor/favicon.svg" >/dev/null 2>&1 || true
 fi
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "Node.js 20.12 or newer is required. Install Node.js, then double-click this file again."
-  printf "Press Enter to close..."
-  read -r
-  exit 1
-fi
-
-node scripts/launch-editor.mjs
+"$project_dir/bootstrap.sh"
 status=$?
 if [[ $status -ne 0 ]]; then
   printf "Press Enter to close..."

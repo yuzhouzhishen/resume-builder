@@ -189,8 +189,10 @@ test("double-click wrappers delegate to the shared launcher without absolute pat
   const windows = readFileSync(windowsPath, "utf8");
   const macIconScript = readFileSync(macIconScriptPath, "utf8");
 
-  assert.match(mac, /node scripts\/launch-editor\.mjs/);
-  assert.match(windows, /node scripts\\launch-editor\.mjs/);
+  assert.match(mac, /bootstrap\.sh/);
+  assert.match(windows, /bootstrap\.ps1/);
+  assert.doesNotMatch(mac, /node scripts\/launch-editor\.mjs/);
+  assert.doesNotMatch(windows, /node scripts\\launch-editor\.mjs/);
   assert.match(mac, /scripts\/set-macos-file-icon\.js/);
   assert.match(mac, /editor\/favicon\.svg/);
   assert.match(macIconScript, /setIconForFileOptions/);

@@ -14,6 +14,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bootstrap-contract:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check platform bootstrap
+        run: node --test scripts/bootstrap.test.mjs
+
   test-and-privacy:
     runs-on: ubuntu-latest
     timeout-minutes: 20

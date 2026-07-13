@@ -36,3 +36,18 @@ test("CI runs the complete local gate with least privilege", () => {
   assert.match(commands, /npx playwright install --with-deps chromium/);
   assert.match(commands, /npm run ci/);
 });
+
+test("CI checks bootstrap contracts on Linux macOS and Windows", () => {
+  const workflow = loadWorkflow();
+  const job = workflow.jobs["bootstrap-contract"];
+
+  assert.ok(job);
+  assert.equal(job["runs-on"], "${{ matrix.os }}");
+  assert.deepEqual(job.strategy.matrix.os, [
+    "ubuntu-latest",
+    "macos-latest",
+    "windows-latest"
+  ]);
+  const commands = job.steps.map(({ run = "" }) => run).join("\n");
+  assert.match(commands, /node --test scripts\/bootstrap\.test\.mjs/);
+});

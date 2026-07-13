@@ -6,66 +6,54 @@
 
 ## 快速开始
 
-先安装 Node.js `20.12` 或更高版本，建议优先选择当前 LTS。Node 是 macOS、Windows 和 Linux 都需要手动预装的唯一启动前提。只需要执行自己操作系统对应的一组命令。
+下载并解压项目后，只需要使用自己操作系统对应的入口。首次启动需要联网；引导器会检查系统和 CPU 架构，优先复用本机已有的 Node.js `20.12+`，否则从 Node.js 官方下载经过 SHA-256 校验的项目专用 Node.js 24 LTS 到用户缓存。随后自动安装缺少的 npm 依赖和 Playwright Chromium，并启动编辑器、打开默认浏览器。
 
 ### macOS
 
-已经安装 [Homebrew](https://brew.sh/) 时，在终端执行：
+双击项目根目录中的：
 
-```bash
-brew install node
+```text
+whoami_.command
 ```
 
 ### Windows
 
-在 PowerShell 中执行：
+双击项目根目录中的：
 
-```powershell
-winget install -e --id OpenJS.NodeJS.LTS
+```text
+whoami_.cmd
 ```
-
-安装完成后关闭并重新打开 PowerShell，使新的 `PATH` 生效。
 
 ### Linux
 
-推荐使用 [nvm](https://github.com/nvm-sh/nvm) 安装当前 LTS 版本：
+在项目根目录执行：
 
 ```bash
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-nvm install --lts
+sh bootstrap.sh
 ```
 
-macOS 没有 Homebrew 时也可以使用这组 nvm 命令。若不使用包管理器，可以从 [Node.js 官方下载页](https://nodejs.org/en/download) 下载当前 LTS 安装程序。
+首次启动可能需要数分钟。项目专用 Node.js 不需要管理员权限，也不会安装到系统目录或修改全局 Node.js：
 
-安装后在新终端中确认 Node.js 和 npm 可用：
+- macOS/Linux：`~/.cache/whoami_/runtime/`
+- Windows：`%LOCALAPPDATA%\whoami_\runtime\`
+
+以后再次启动会直接复用缓存。启动器会自动定位项目和私人数据目录；运行期间保留终端窗口，按 `Ctrl+C` 或关闭窗口即可停止服务。也可以先只检查本机将使用哪个运行时，不下载或启动任何内容：
 
 ```bash
-node --version
-npm --version
+sh bootstrap.sh --check
 ```
 
-`node --version` 应显示 `v20.12.0` 或更高版本。
+Windows PowerShell 对应命令是：
 
-macOS 和 Windows 日常使用可以直接双击项目根目录中的启动文件：
-
-- macOS：`whoami_.command`
-- Windows：`whoami_.cmd`
-
-启动器会自动定位项目目录。缺少 npm 依赖时执行 `npm install`，缺少 Playwright Chromium 时执行 `npx playwright install chromium`；随后复用已经运行的同一数据目录实例，或启动新服务并打开默认浏览器。运行期间保留终端窗口，按 `Ctrl+C` 或关闭窗口即可停止服务。
-
-所有系统也可以从终端启动并自动打开浏览器；Linux 使用这一方式：
-
-```bash
-npm run editor:open
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 -Check
 ```
 
-先在终端进入项目目录。原有手动方式也保持可用：
+已经自行安装 Node.js `20.12+` 的开发者仍可使用原有命令：
 
 ```bash
 npm install
-npm run editor
+npm run editor:open
 ```
 
 终端会输出类似：
@@ -101,6 +89,9 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 
 ## 当前文档
 
+- [V2.8 当前边界](docs/v2-8-boundaries.md)
+- [V2.8 验收清单](docs/v2-8-acceptance-checklist.md)
+- [V2.8 零安装引导设计](docs/plans/2026-07-13-v2-8-zero-install-bootstrap-design.md)
 - [V2.7 当前边界](docs/v2-7-boundaries.md)
 - [V2.7 验收清单](docs/v2-7-acceptance-checklist.md)
 - [V2.7 发布收尾计划](docs/plans/2026-07-12-v2-7-release-closure.md)
@@ -137,21 +128,34 @@ Resume data: /absolute/path/to/resume-builder-data (existing)
 - [V1.1 历史边界](docs/v1-boundaries.md)
 - [V0 历史边界](docs/v0-boundaries.md)
 
-## 首次安装
+## 手动环境方案
 
-安装 Node.js `20.12+` 后，可以直接双击对应系统的启动文件，npm 依赖和 Chromium 会在缺失时自动安装。也可以手动执行：
+引导器不调用 Homebrew、winget、apt 等系统包管理器。如果不希望使用项目专用 Node.js，可以先手动安装 Node.js `20.12+`，建议使用当前 LTS。
 
-```bash
-npm install
-```
-
-如果提示 Chromium 缺失：
+macOS 已安装 [Homebrew](https://brew.sh/) 时：
 
 ```bash
-npx playwright install chromium
+brew install node
 ```
 
-如果提示 Poppler 缺失：
+Windows PowerShell：
+
+```powershell
+winget install -e --id OpenJS.NodeJS.LTS
+```
+
+Linux 推荐使用 [nvm](https://github.com/nvm-sh/nvm)：
+
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+nvm install --lts
+```
+
+安装后重新打开终端并执行 `node --version` 和 `npm --version`。也可以从 [Node.js 官方下载页](https://nodejs.org/en/download) 获取安装程序。
+
+Poppler目前不由引导器安装。缺失时仍可编辑和保存内容，但正式 PDF/PNG 生成会提示安装依赖。
 
 macOS：
 
@@ -457,7 +461,7 @@ YAML 对英文冒号加空格比较敏感，例如：
 
 ### 双击启动文件后立即关闭怎么办？
 
-先确认已安装 Node.js `20.12+`，并重新双击。启动失败时 macOS 和 Windows 启动文件会保留错误信息；常见原因是 Node 未加入 `PATH`、首次安装依赖时网络不可用，或者 `4321-4330` 全部被占用。
+启动失败时 macOS 和 Windows 启动文件会保留错误信息。常见原因是首次启动无法访问 `nodejs.org`、npm 或 Playwright 下载源，下载文件校验失败，或者 `4321-4330` 全部被占用。可以先运行 `bootstrap.sh --check` 或 `bootstrap.ps1 -Check` 查看平台、架构和 Node 来源；检查模式不会下载或启动编辑器。
 
 ### 提示前端和后端版本不一致怎么办？
 
