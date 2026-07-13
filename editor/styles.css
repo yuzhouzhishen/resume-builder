@@ -459,6 +459,20 @@ button:disabled {
   letter-spacing: 0;
 }
 
+.brand-wordmark {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-weight: 650;
+}
+
+.brand-wordmark .brand-soft {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.brand-wordmark .brand-accent {
+  color: #f43f7d;
+}
+
 .editor-header p {
   margin: 4px 0 0;
   color: var(--muted);

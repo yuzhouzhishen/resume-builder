@@ -495,7 +495,8 @@ test("editor server serves the local editor shell", async (t) => {
   const html = await response.text();
 
   assert.equal(response.status, 200);
-  assert.match(html, /简历编辑器/);
+  assert.match(html, /<title>whoami_<\/title>/);
+  assert.match(html, /<h1 class="brand-wordmark" aria-label="whoami_">/);
   assert.match(html, /id="app"/);
   assert.match(html, /id="previewFrame"/);
   assert.match(html, /A4 待测量/);
@@ -582,6 +583,7 @@ test("editor server serves editor and output static files", async (t) => {
   const previewResponse = await fetch(`${app.url}/output/resume.png`);
   const htmlPreviewResponse = await fetch(`${app.url}/output/cpp/preview.html`);
   const script = await scriptResponse.text();
+  const favicon = await faviconResponse.text();
   const htmlPreview = await htmlPreviewResponse.text();
 
   assert.equal(scriptResponse.status, 200);
@@ -590,6 +592,7 @@ test("editor server serves editor and output static files", async (t) => {
   assert.match(script, /上一版已备份/);
   assert.equal(faviconResponse.status, 200);
   assert.match(faviconResponse.headers.get("content-type"), /image\/svg\+xml/);
+  assert.match(favicon, /<title>whoami terminal pulse<\/title>/);
   assert.equal(previewResponse.status, 200);
   assert.match(previewResponse.headers.get("content-type"), /image\/png/);
   assert.equal(htmlPreviewResponse.status, 200);
