@@ -76,6 +76,8 @@ test("Windows bootstrap uses a per-user runtime and verifies downloads", () => {
   assert.match(source, /whoami_/);
   assert.match(source, /scripts[\\/]launch-editor\.mjs/);
   assert.match(source, /\[switch\]\$Check/);
+  assert.match(source, /\$NodePath --version/);
+  assert.doesNotMatch(source, /\$NodePath -e/);
   assert.doesNotMatch(source, /^'@\s+\S/m);
   assert.doesNotMatch(source, /winget install|choco install|scoop install/);
 

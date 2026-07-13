@@ -32,9 +32,17 @@ function Test-NodeSupported([string]$NodePath, [string]$MinimumVersion) {
   if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) {
     return $false
   }
-  $versionCheck = 'const c=process.versions.node.split(".").map(Number),m=process.argv[1].split(".").map(Number);for(let i=0;i<3;i+=1){if(c[i]>m[i])process.exit(0);if(c[i]<m[i])process.exit(1)}'
-  & $NodePath -e $versionCheck $MinimumVersion *> $null
-  return $LASTEXITCODE -eq 0
+  $rawVersion = & $NodePath --version 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    return $false
+  }
+  try {
+    $current = [version]$rawVersion.Trim().TrimStart("v")
+    $minimum = [version]$MinimumVersion
+    return $current -ge $minimum
+  } catch {
+    return $false
+  }
 }
 
 function Test-LocalNodeReady(
