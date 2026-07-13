@@ -10,8 +10,8 @@
 
 日常使用可以直接双击项目根目录中的启动文件：
 
-- macOS：`Start Resume Builder.command`
-- Windows：`Start Resume Builder.cmd`
+- macOS：`whoami_.command`
+- Windows：`whoami_.cmd`
 
 启动器会自动定位项目目录。缺少 npm 依赖时执行 `npm install`，缺少 Playwright Chromium 时执行 `npx playwright install chromium`；随后复用已经运行的同一数据目录实例，或启动新服务并打开默认浏览器。运行期间保留终端窗口，按 `Ctrl+C` 或关闭窗口即可停止服务。
 

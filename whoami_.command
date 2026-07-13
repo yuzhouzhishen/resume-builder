@@ -7,7 +7,16 @@ if [[ -z "${RESUME_BUILDER_LOGIN_SHELL:-}" ]]; then
   exec /bin/zsh -l "$0" "$@"
 fi
 
-cd -- "${0:A:h}" || exit 1
+project_dir="${0:A:h}"
+launcher_path="${0:A}"
+cd -- "$project_dir" || exit 1
+
+if [[ -x /usr/bin/osascript ]]; then
+  /usr/bin/osascript -l JavaScript \
+    scripts/set-macos-file-icon.js \
+    "$launcher_path" \
+    "$project_dir/editor/favicon.svg" >/dev/null 2>&1 || true
+fi
 
 if ! command -v node >/dev/null 2>&1; then
   echo "Node.js 20.12 or newer is required. Install Node.js, then double-click this file again."

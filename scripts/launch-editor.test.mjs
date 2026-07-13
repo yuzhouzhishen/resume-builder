@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -175,13 +175,25 @@ test("launcher starts and opens the actual fallback URL when no instance exists"
 });
 
 test("double-click wrappers delegate to the shared launcher without absolute paths", () => {
-  const macPath = path.join(PROJECT_ROOT, "Start Resume Builder.command");
-  const windowsPath = path.join(PROJECT_ROOT, "Start Resume Builder.cmd");
+  const macPath = path.join(PROJECT_ROOT, "whoami_.command");
+  const windowsPath = path.join(PROJECT_ROOT, "whoami_.cmd");
+  const macIconScriptPath = path.join(PROJECT_ROOT, "scripts/set-macos-file-icon.js");
+
+  assert.equal(existsSync(macPath), true);
+  assert.equal(existsSync(windowsPath), true);
+  assert.equal(existsSync(macIconScriptPath), true);
+  assert.equal(existsSync(path.join(PROJECT_ROOT, "Start Resume Builder.command")), false);
+  assert.equal(existsSync(path.join(PROJECT_ROOT, "Start Resume Builder.cmd")), false);
+
   const mac = readFileSync(macPath, "utf8");
   const windows = readFileSync(windowsPath, "utf8");
+  const macIconScript = readFileSync(macIconScriptPath, "utf8");
 
   assert.match(mac, /node scripts\/launch-editor\.mjs/);
   assert.match(windows, /node scripts\\launch-editor\.mjs/);
+  assert.match(mac, /scripts\/set-macos-file-icon\.js/);
+  assert.match(mac, /editor\/favicon\.svg/);
+  assert.match(macIconScript, /setIconForFileOptions/);
   assert.doesNotMatch(mac, /\/Users\//);
   assert.doesNotMatch(windows, /[A-Z]:\\Users\\/i);
   assert.notEqual(statSync(macPath).mode & 0o111, 0);

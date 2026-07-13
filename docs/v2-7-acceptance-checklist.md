@@ -23,7 +23,7 @@ Date: 2026-07-12
 ## Windows Manual Acceptance
 
 - [ ] Install Node.js `20.12+` and clone the repository on a real Windows computer.
-- [ ] Double-click `Start Resume Builder.cmd` and confirm dependencies, Chromium, service startup and browser opening.
+- [ ] Double-click `whoami_.cmd` and confirm dependencies, Chromium, service startup and browser opening.
 - [ ] Confirm a second launch reuses the running matching instance.
 - [ ] Confirm `Ctrl+C` stops the service and startup errors remain visible.
 - [ ] Install Poppler on `PATH` and generate a standard one-page A4 PDF and PNG.

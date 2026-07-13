@@ -12,8 +12,8 @@ Start the local Resume Builder and open its browser UI by double-clicking on mac
 
 Place all behavior in a dependency-light Node entry point, `scripts/launch-editor.mjs`. The OS files are thin wrappers that locate their own project directory and call the same Node launcher:
 
-- `Start Resume Builder.command` for macOS.
-- `Start Resume Builder.cmd` for Windows.
+- `whoami_.command` for macOS.
+- `whoami_.cmd` for Windows.
 - `npm run editor:open` for any supported terminal.
 
 Node.js 20.12 or newer is the only prerequisite that is not installed automatically. The README documents installing Node before cloning or starting the project.

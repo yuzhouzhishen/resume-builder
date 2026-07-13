@@ -8,7 +8,7 @@ V2.7 is a stable local-use release of the one-page A4 resume editor. It combines
 
 The recommended workflow is:
 
-1. Double-click `Start Resume Builder.command` on macOS or `Start Resume Builder.cmd` on Windows.
+1. Double-click `whoami_.command` on macOS or `whoami_.cmd` on Windows.
 2. Edit content or per-resume layout settings in the browser while viewing the live A4 draft.
 3. Use preview field selection, undo/redo and local draft recovery during editing.
 4. Save the current YAML explicitly, then generate the formal PDF, PNG and HTML output explicitly.

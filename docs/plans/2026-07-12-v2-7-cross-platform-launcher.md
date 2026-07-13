@@ -40,8 +40,8 @@
 
 **Files:**
 - Create: `scripts/launch-editor.mjs`
-- Create: `Start Resume Builder.command`
-- Create: `Start Resume Builder.cmd`
+- Create: `whoami_.command`
+- Create: `whoami_.cmd`
 - Modify: `package.json`
 - Test: `scripts/launch-editor.test.mjs`
 
