@@ -499,6 +499,7 @@ test("editor server serves the local editor shell", async (t) => {
   assert.match(html, /id="app"/);
   assert.match(html, /id="previewFrame"/);
   assert.match(html, /A4 待测量/);
+  assert.match(html, /<link rel="icon" href="\/editor\/favicon\.svg" type="image\/svg\+xml">/);
   assert.doesNotMatch(html, /id="previewImage"/);
 });
 
@@ -577,6 +578,7 @@ test("editor server serves editor and output static files", async (t) => {
   });
 
   const scriptResponse = await fetch(`${app.url}/editor/app.js`);
+  const faviconResponse = await fetch(`${app.url}/editor/favicon.svg`);
   const previewResponse = await fetch(`${app.url}/output/resume.png`);
   const htmlPreviewResponse = await fetch(`${app.url}/output/cpp/preview.html`);
   const script = await scriptResponse.text();
@@ -586,6 +588,8 @@ test("editor server serves editor and output static files", async (t) => {
   assert.match(scriptResponse.headers.get("content-type"), /javascript/);
   assert.match(script, /loadResume/);
   assert.match(script, /上一版已备份/);
+  assert.equal(faviconResponse.status, 200);
+  assert.match(faviconResponse.headers.get("content-type"), /image\/svg\+xml/);
   assert.equal(previewResponse.status, 200);
   assert.match(previewResponse.headers.get("content-type"), /image\/png/);
   assert.equal(htmlPreviewResponse.status, 200);
