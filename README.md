@@ -6,16 +6,56 @@
 
 ## 快速开始
 
-先安装 Node.js `20.12` 或更高版本。Node 是 macOS 和 Windows 都需要手动预装的唯一启动前提。
+先安装 Node.js `20.12` 或更高版本，建议优先选择当前 LTS。Node 是 macOS、Windows 和 Linux 都需要手动预装的唯一启动前提。只需要执行自己操作系统对应的一组命令。
 
-日常使用可以直接双击项目根目录中的启动文件：
+### macOS
+
+已经安装 [Homebrew](https://brew.sh/) 时，在终端执行：
+
+```bash
+brew install node
+```
+
+### Windows
+
+在 PowerShell 中执行：
+
+```powershell
+winget install -e --id OpenJS.NodeJS.LTS
+```
+
+安装完成后关闭并重新打开 PowerShell，使新的 `PATH` 生效。
+
+### Linux
+
+推荐使用 [nvm](https://github.com/nvm-sh/nvm) 安装当前 LTS 版本：
+
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+nvm install --lts
+```
+
+macOS 没有 Homebrew 时也可以使用这组 nvm 命令。若不使用包管理器，可以从 [Node.js 官方下载页](https://nodejs.org/en/download) 下载当前 LTS 安装程序。
+
+安装后在新终端中确认 Node.js 和 npm 可用：
+
+```bash
+node --version
+npm --version
+```
+
+`node --version` 应显示 `v20.12.0` 或更高版本。
+
+macOS 和 Windows 日常使用可以直接双击项目根目录中的启动文件：
 
 - macOS：`whoami_.command`
 - Windows：`whoami_.cmd`
 
 启动器会自动定位项目目录。缺少 npm 依赖时执行 `npm install`，缺少 Playwright Chromium 时执行 `npx playwright install chromium`；随后复用已经运行的同一数据目录实例，或启动新服务并打开默认浏览器。运行期间保留终端窗口，按 `Ctrl+C` 或关闭窗口即可停止服务。
 
-也可以从终端启动并自动打开浏览器：
+所有系统也可以从终端启动并自动打开浏览器；Linux 使用这一方式：
 
 ```bash
 npm run editor:open
